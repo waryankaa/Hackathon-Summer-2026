@@ -1,0 +1,52 @@
+Cell types:
+DH_ex_Gpr83
+DH_ex_Grpr
+
+Best model: LogisticRegression
+Number of genes: 40
+
+Balanced accuracy: 0.6433 +/- 0.1165
+Accuracy: 0.6408 +/- 0.1147
+Macro F1: 0.6329 +/- 0.1171
+
+Selected genes:
+Cck
+Adcyap1r1
+Grik1
+Nrgn
+Spr
+Prox1
+Dpy19l1
+Dlk1
+Crhr1
+Ctss
+Pcdhb9
+Pmp22
+Rorb
+Sema6c
+Pcdha7
+Pvalb
+Bnc2
+Pcdhga11
+Pcdhga12
+Plxna1
+Pcdhb19
+Adra2a
+Pcdhga9
+Col23a1
+Sema5b
+Pcdha11
+Pdyn
+Calcrl
+Pcdhgb4
+Plxnc1
+Pcdhb11
+Pcdhgc5
+Ptgds
+Mc4r
+Gabrg2
+Calb1
+Npas4
+Fosb
+Grik3
+Zfhx3

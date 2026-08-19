@@ -1,0 +1,29 @@
+section,ei_group,n_cells,n_cell_types,cell_types,route_type,best_model,number_of_genes,inner_accuracy,inner_balanced_accuracy,inner_macro_f1,total_outer_folds,folds_with_model,most_common_cv_model,model_wins,model_stability,model_stability_when_modeled,most_common_cv_configuration,configuration_wins,configuration_stability,configuration_stability_when_modeled,final_configuration,final_model_matches_cv_mode,final_configuration_matches_cv_mode
+1,ALL,36,1,DH_ex_Reln/Npff,direct_section,,,,,,,,,,,,,,,,,False,False
+10,excitatory,96,4,DH_ex_Maf/Cck | DH_ex_Maf/Cpne4 | DH_ex_Maf/Slc17a8 | DH_ex_Rreb1,subgroup_model,LogisticRegression,10.0,0.47736842105263155,0.3490384615384616,0.33799206349206345,3.0,3.0,ExtraTrees,1.0,0.3333333333333333,0.3333333333333333,ExtraTrees + 2 genes,1.0,0.3333333333333333,0.3333333333333333,LogisticRegression + 10 genes,False,False
+10,inhibitory,140,2,DH_in_Cdh3 | DH_in_Klhl14,subgroup_model,LogisticRegression,40.0,0.7642857142857143,0.5279710144927535,0.5280606214116853,3.0,3.0,ExtraTrees,2.0,0.6666666666666666,0.6666666666666666,ExtraTrees + 40 genes,2.0,0.6666666666666666,0.6666666666666666,LogisticRegression + 40 genes,False,False
+11,ALL,133,1,DM_ex_Zfhx3,direct_section,,,,,,,,,,,,,,,,,False,False
+12,ALL,73,1,M_in_Tfap2b,direct_section,,,,,,,,,,,,,,,,,False,False
+13,ALL,11,1,M_ex_Neurod2,direct_section,,,,,,,,,,,,,,,,,False,False
+14,excitatory,113,1,MV_ex_Syt2,direct_section_EI,,,,,,,,,,,,,,,,,False,False
+14,inhibitory,63,1,MV_in_Esrrb,direct_section_EI,,,,,,,,,,,,,,,,,False,False
+15,ALL,94,1,MV_in_Sema5b,direct_section,,,,,,,,,,,,,,,,,False,False
+16,ALL,145,1,MV_in_Gabra1,direct_section,,,,,,,,,,,,,,,,,False,False
+17,ALL,3,1,VH_in_Chat,direct_section,,,,,,,,,,,,,,,,,False,False
+18,ALL,42,1,MV_ex_Shox2,direct_section,,,,,,,,,,,,,,,,,False,False
+19,inhibitory,132,2,MV_in_Chrna2 | MV_in_Gm26673,subgroup_model,LogisticRegression,20.0,0.9094017094017094,0.9095454545454545,0.8608144077514469,3.0,3.0,LogisticRegression,3.0,1.0,1.0,LogisticRegression + 20 genes,1.0,0.3333333333333333,0.3333333333333333,LogisticRegression + 20 genes,True,True
+2,excitatory,64,2,DH_ex_Gpr83 | DH_ex_Grpr,subgroup_model,ExtraTrees,1.0,0.6884615384615385,0.6952380952380952,0.6823701298701299,3.0,3.0,RandomForest,2.0,0.6666666666666666,0.6666666666666666,RandomForest + 2 genes,1.0,0.3333333333333333,0.3333333333333333,ExtraTrees + 1 genes,False,False
+2,inhibitory,59,1,DH_in_Pdyn,direct_section_EI,,,,,,,,,,,,,,,,,False,False
+20,__NA__,8,1,visceral_motoneuron,direct_section_EI,,,,,,,,,,,,,,,,,False,False
+20,excitatory,49,2,M_ex_Vsx2 | M_ex_Vsx2/Shox2,subgroup_model,LogisticRegression,1.0,0.9400000000000001,0.9466666666666667,0.9397979797979797,3.0,3.0,LogisticRegression,2.0,0.6666666666666666,0.6666666666666666,ExtraTrees + 2 genes,1.0,0.3333333333333333,0.3333333333333333,LogisticRegression + 1 genes,True,False
+21,ALL,7,1,cholinergic_interneuron,direct_section,,,,,,,,,,,,,,,,,False,False
+22,__NA__,169,3,alpha_motoneuron | beta_motoneuron | gamma_motoneuron,subgroup_model,ExtraTrees,40.0,0.7336898395721925,0.8192207792207793,0.6945909539017394,3.0,3.0,LogisticRegression,3.0,1.0,1.0,LogisticRegression + 5 genes,2.0,0.6666666666666666,0.6666666666666666,ExtraTrees + 40 genes,False,False
+3,excitatory,93,2,DH_ex_Cpne4 | DH_ex_Reln/Nmur2,subgroup_model,ExtraTrees,40.0,0.902923976608187,0.8646886446886448,0.8736604136604136,3.0,3.0,RandomForest,1.0,0.3333333333333333,0.3333333333333333,RandomForest + 40 genes,1.0,0.3333333333333333,0.3333333333333333,ExtraTrees + 40 genes,False,False
+4,inhibitory,59,2,DH_in_Cdh3 | DH_in_Npy,subgroup_model,LogisticRegression,1.0,0.9666666666666666,0.9818181818181818,0.9238095238095237,3.0,3.0,LogisticRegression,3.0,1.0,1.0,LogisticRegression + 1 genes,3.0,1.0,1.0,LogisticRegression + 1 genes,True,True
+5,excitatory,82,2,DH_ex_Sox5 | DH_ex_Sox5/Tac1,subgroup_model,LogisticRegression,20.0,1.0,1.0,1.0,3.0,3.0,LogisticRegression,3.0,1.0,1.0,LogisticRegression + 1 genes,3.0,1.0,1.0,LogisticRegression + 20 genes,True,False
+5,inhibitory,26,1,DH_in_Pdyn/Gal,direct_section_EI,,,,,,,,,,,,,,,,,False,False
+6,excitatory,89,3,DH_ex_Grp | DH_ex_Prkcg/Rxfp1 | DH_ex_Reln,subgroup_model,ExtraTrees,40.0,0.7313725490196077,0.711111111111111,0.6941889591889592,3.0,3.0,LogisticRegression,2.0,0.6666666666666666,0.6666666666666666,LogisticRegression + 5 genes,2.0,0.6666666666666666,0.6666666666666666,ExtraTrees + 40 genes,False,False
+7,ALL,29,1,DH_in_Rorb,direct_section,,,,,,,,,,,,,,,,,False,False
+8,excitatory,181,4,DH_ex_Nmu/Tac2 | DH_ex_Prkcg/Cck | DH_ex_Prkcg/Nts | DH_ex_Tac2,subgroup_model,RandomForest,10.0,0.7013513513513513,0.6642707292707293,0.6442862556833144,3.0,3.0,RandomForest,2.0,0.6666666666666666,0.6666666666666666,LogisticRegression + 5 genes,1.0,0.3333333333333333,0.3333333333333333,RandomForest + 10 genes,True,False
+9,inhibitory,46,2,DH_in_Kcnip2 | DH_in_Npy2r,subgroup_model,RandomForest,40.0,0.7822222222222222,0.6714285714285715,0.6321428571428571,3.0,3.0,RandomForest,3.0,1.0,1.0,RandomForest + 40 genes,2.0,0.6666666666666666,0.6666666666666666,RandomForest + 40 genes,True,True
+__NA__,__NA__,2958,16,Schwann_cell | astrocyte_1 | astrocyte_2 | endothelial | ependymal | meninges_1 | meninges_2 | meninges_3 | microglia | oligodendrocyte_1 | oligodendrocyte_2 | oligodendrocyte_precursor_cell | oligodendrocyte_progenitor_1 | oligodendrocyte_progenitor_2 | pericyte | peripheral_glia,subgroup_model,LogisticRegression,40.0,0.6061593954360452,0.609749851859358,0.5425509357831564,3.0,3.0,ExtraTrees,2.0,0.6666666666666666,0.6666666666666666,ExtraTrees + 40 genes,2.0,0.6666666666666666,0.6666666666666666,LogisticRegression + 40 genes,False,False

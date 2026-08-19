@@ -1,0 +1,4 @@
+|--- Grik1 <= 1.50
+|   |--- class: DH_ex_Grpr
+|--- Grik1 >  1.50
+|   |--- class: DH_ex_Gpr83

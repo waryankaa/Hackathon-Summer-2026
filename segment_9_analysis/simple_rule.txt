@@ -1,0 +1,4 @@
+|--- Sema6d <= 2.50
+|   |--- class: DH_in_Kcnip2
+|--- Sema6d >  2.50
+|   |--- class: DH_in_Npy2r

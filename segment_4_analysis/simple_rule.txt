@@ -1,0 +1,4 @@
+|--- Chrm3 <= 0.50
+|   |--- class: DH_in_Npy
+|--- Chrm3 >  0.50
+|   |--- class: DH_in_Cdh3

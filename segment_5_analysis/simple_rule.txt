@@ -1,0 +1,4 @@
+|--- Tac1 <= 0.50
+|   |--- class: DH_ex_Sox5
+|--- Tac1 >  0.50
+|   |--- class: DH_ex_Sox5/Tac1

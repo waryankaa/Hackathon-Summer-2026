@@ -1,0 +1,4 @@
+Unnamed: 0,Datasets,volume,center_x,center_y,MERFISH_cell_type_annotation,Region,Excitatory_vs_Inhibitory,Segment,Gender,Mouse_ID,AP_position,Section_ID
+2656144300171100041,20240328,3334.590576,10756.39274,12153.90643,VH_in_Chat,5.0,inhibitory,17.0,female,F2,4,0328_F2_T
+2787445900622100095,20240503,837.1221313,8632.504408,4486.035401,VH_in_Chat,5.0,inhibitory,17.0,female,F3,1,0503_F3_C
+2787889600445100169,20240503,1984.752441,5857.984492,9285.436484,VH_in_Chat,5.0,inhibitory,17.0,male,M4,2,0503_M4_L

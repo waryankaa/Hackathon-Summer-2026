@@ -1,0 +1,4 @@
+|--- Bnc2 <= 3.50
+|   |--- class: DH_ex_Reln/Nmur2
+|--- Bnc2 >  3.50
+|   |--- class: DH_ex_Cpne4

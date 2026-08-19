@@ -1,0 +1,14 @@
+section,ei_group,total_outer_folds,folds_with_model,most_common_cv_model,model_wins,model_stability,model_stability_when_modeled,most_common_cv_configuration,configuration_wins,configuration_stability,configuration_stability_when_modeled
+10,excitatory,3,3,ExtraTrees,1,0.3333333333333333,0.3333333333333333,ExtraTrees + 2 genes,1,0.3333333333333333,0.3333333333333333
+10,inhibitory,3,3,ExtraTrees,2,0.6666666666666666,0.6666666666666666,ExtraTrees + 40 genes,2,0.6666666666666666,0.6666666666666666
+19,inhibitory,3,3,LogisticRegression,3,1.0,1.0,LogisticRegression + 20 genes,1,0.3333333333333333,0.3333333333333333
+2,excitatory,3,3,RandomForest,2,0.6666666666666666,0.6666666666666666,RandomForest + 2 genes,1,0.3333333333333333,0.3333333333333333
+20,excitatory,3,3,LogisticRegression,2,0.6666666666666666,0.6666666666666666,ExtraTrees + 2 genes,1,0.3333333333333333,0.3333333333333333
+22,__NA__,3,3,LogisticRegression,3,1.0,1.0,LogisticRegression + 5 genes,2,0.6666666666666666,0.6666666666666666
+3,excitatory,3,3,RandomForest,1,0.3333333333333333,0.3333333333333333,RandomForest + 40 genes,1,0.3333333333333333,0.3333333333333333
+4,inhibitory,3,3,LogisticRegression,3,1.0,1.0,LogisticRegression + 1 genes,3,1.0,1.0
+5,excitatory,3,3,LogisticRegression,3,1.0,1.0,LogisticRegression + 1 genes,3,1.0,1.0
+6,excitatory,3,3,LogisticRegression,2,0.6666666666666666,0.6666666666666666,LogisticRegression + 5 genes,2,0.6666666666666666,0.6666666666666666
+8,excitatory,3,3,RandomForest,2,0.6666666666666666,0.6666666666666666,LogisticRegression + 5 genes,1,0.3333333333333333,0.3333333333333333
+9,inhibitory,3,3,RandomForest,3,1.0,1.0,RandomForest + 40 genes,2,0.6666666666666666,0.6666666666666666
+__NA__,__NA__,3,3,ExtraTrees,2,0.6666666666666666,0.6666666666666666,ExtraTrees + 40 genes,2,0.6666666666666666,0.6666666666666666
