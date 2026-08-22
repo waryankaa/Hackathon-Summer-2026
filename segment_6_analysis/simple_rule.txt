@@ -1,0 +1,9 @@
+Gene: Chrm4
+
+|--- Chrm4 <= 0.50
+|   |--- class: DH_ex_Grp
+|--- Chrm4 >  0.50
+|   |--- Chrm4 <= 1.50
+|   |   |--- class: DH_ex_Reln
+|   |--- Chrm4 >  1.50
+|   |   |--- class: DH_ex_Reln

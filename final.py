@@ -1,28 +1,33 @@
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import VarianceThreshold, f_classif
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.model_selection import StratifiedKFold, KFold, GroupKFold, cross_validate
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import StratifiedKFold, cross_validate
 
 
 # ============================================================
 # FILES
 # ============================================================
 
-TRAIN_FILE = Path("/Users/abigailwaryanka/Desktop/Hackathon-Summer-2026/data/full_train.csv")
-TEST_FILE = Path("/Users/abigailwaryanka/Desktop/Hackathon-Summer-2026/data/full_test.csv")
-OUTPUT_DIR = Path("/Users/abigailwaryanka/Desktop/Hackathon-Summer-2026/hierarchical_model")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+ROOT = Path("/Users/abigailwaryanka/Desktop/Hackathon-Summer-2026")
+
+TRAIN_FILE = ROOT / "data/full_train.csv"
+TEST_FILE = ROOT / "data/full_test.csv"
+
+PAIR_FILE = ROOT / "difficult_cell_types_nearest_neighbor_genes (1)(1).csv"
+
+OUT = ROOT / "final_combined_predictions"
+OUT.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -30,28 +35,26 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
 
 TARGET = "MERFISH_cell_type_annotation"
-
-# Change to "Section_ID" if you mean Section_ID instead of Segment.
 SECTION_COL = "Segment"
-
 EI_COL = "Excitatory_vs_Inhibitory"
-MOUSE_GROUP_COL = "Mouse_ID"
+SEED = 42
 
-RANDOM_STATE = 42
+MODELS = [
+    "LogisticRegression",
+    "RandomForest",
+    "ExtraTrees",
+]
 
-OUTER_SPLITS = 5
-INNER_MAX_SPLITS = 5
-
-# "stratified" = random cells
-# "mouse" = hold out entire mice
-OUTER_MODE = "stratified"
-
-MODEL_NAMES = ["LogisticRegression", "RandomForest", "ExtraTrees"]
 GENE_COUNTS = [1, 2, 3, 5, 10, 20, 40]
 
-NUMERIC_METADATA = ["AP_position", "volume"]
+INNER_MAX_SPLITS = 5
 
-NON_GENE_COLUMNS = [
+NUMERIC_METADATA = [
+    "AP_position",
+    "volume",
+]
+
+NON_GENE = [
     "Datasets",
     "volume",
     "center_x",
@@ -68,7 +71,42 @@ NON_GENE_COLUMNS = [
 
 
 # ============================================================
-# SAFE FEATURE SELECTION
+# BEST NA MODEL SETTINGS
+# ============================================================
+
+ASTRO_T = 0.70
+OLIGO_T = 0.30
+
+# Highest-accuracy oligo specialist settings
+M1 = 0.25
+M2 = 0.25
+
+ASTRO = [
+    "astrocyte_1",
+    "astrocyte_2",
+]
+
+OLIGO = [
+    "oligodendrocyte_1",
+    "oligodendrocyte_2",
+    "oligodendrocyte_precursor_cell",
+    "oligodendrocyte_progenitor_1",
+    "oligodendrocyte_progenitor_2",
+]
+
+PAIR1 = tuple(sorted([
+    "oligodendrocyte_1",
+    "oligodendrocyte_progenitor_2",
+]))
+
+PAIR2 = tuple(sorted([
+    "oligodendrocyte_precursor_cell",
+    "oligodendrocyte_progenitor_1",
+]))
+
+
+# ============================================================
+# GENERAL HELPERS
 # ============================================================
 
 class SafeSelectKBest(BaseEstimator, TransformerMixin):
@@ -77,1115 +115,1234 @@ class SafeSelectKBest(BaseEstimator, TransformerMixin):
         self.k = k
 
     def fit(self, X, y):
+
         X = np.asarray(X)
 
         if X.shape[1] == 0:
-            raise ValueError("No features remain after variance filtering.")
+            raise ValueError("No features remain.")
 
-        self.k_ = min(self.k, X.shape[1])
+        self.k_ = min(
+            self.k,
+            X.shape[1],
+        )
 
-        scores, p_values = f_classif(X, y)
+        scores, _ = f_classif(
+            X,
+            y,
+        )
 
-        self.scores_ = np.nan_to_num(
+        scores = np.nan_to_num(
             scores,
             nan=-np.inf,
             posinf=np.finfo(float).max,
             neginf=-np.inf,
         )
 
-        self.pvalues_ = p_values
-
-        ranked = np.argsort(self.scores_)[::-1]
-        self.selected_indices_ = np.sort(ranked[:self.k_])
+        self.selected_indices_ = np.sort(
+            np.argsort(scores)[::-1][:self.k_]
+        )
 
         return self
 
     def transform(self, X):
-        X = np.asarray(X)
-        return X[:, self.selected_indices_]
 
-    def get_support(self, indices=False):
-        if indices:
-            return self.selected_indices_
+        return np.asarray(X)[
+            :, self.selected_indices_
+        ]
 
-        mask = np.zeros(len(self.scores_), dtype=bool)
-        mask[self.selected_indices_] = True
-        return mask
-
-
-# ============================================================
-# DATA HELPERS
-# ============================================================
 
 def log1p_nonnegative(X):
-    X = np.asarray(X, dtype=float)
-    return np.log1p(np.clip(X, 0, None))
+
+    return np.log1p(
+        np.clip(
+            np.asarray(X, dtype=float),
+            0,
+            None,
+        )
+    )
 
 
-def clean_group_value(value):
+def clean_group(x):
 
-    if pd.isna(value):
+    if pd.isna(x):
         return "__NA__"
 
     try:
-        number = float(value)
 
-        if number.is_integer():
-            return str(int(number))
+        n = float(x)
+
+        if n.is_integer():
+            return str(int(n))
 
     except (ValueError, TypeError):
         pass
 
-    return str(value)
+    return str(x)
 
 
-def prepare_dataframe(df):
+def prepare(df):
+
     df = df.copy()
-    df["_section"] = df[SECTION_COL].apply(clean_group_value)
-    df["_ei"] = df[EI_COL].apply(clean_group_value)
+
+    df["_section"] = (
+        df[SECTION_COL]
+        .apply(clean_group)
+    )
+
+    df["_ei"] = (
+        df[EI_COL]
+        .apply(clean_group)
+    )
+
     return df
 
 
-def find_id_column(df):
+def id_column(df):
 
-    first_column = df.columns[0]
+    first = df.columns[0]
 
-    if str(first_column).startswith("Unnamed:") or df[first_column].nunique() == len(df):
-        return first_column
+    if (
+        str(first).startswith("Unnamed:")
+        or df[first].nunique() == len(df)
+    ):
+        return first
 
     return None
 
 
-def find_gene_columns(train_df, test_df, id_column):
+def gene_columns(train, test, id_col):
 
-    excluded = set(NON_GENE_COLUMNS + ["_section", "_ei"])
+    excluded = set(
+        NON_GENE
+        + ["_section", "_ei"]
+    )
 
-    if id_column is not None:
-        excluded.add(id_column)
+    if id_col is not None:
+        excluded.add(id_col)
 
     return [
-        column
-        for column in train_df.columns
-        if column not in excluded and column in test_df.columns
+        c
+        for c in train.columns
+        if c not in excluded
+        and c in test.columns
     ]
 
 
 # ============================================================
-# BUILD MODEL
+# ORIGINAL HIERARCHICAL MODEL
 # ============================================================
 
-def build_pipeline(model_name, number_of_genes, gene_columns, numeric_metadata):
+def build_pipeline(
+    model_name,
+    k,
+    genes,
+    numeric,
+):
 
-    gene_steps = [
-        ("imputer", SimpleImputer(strategy="constant", fill_value=0)),
-        ("log_transform", FunctionTransformer(log1p_nonnegative, validate=False)),
-        ("remove_constant", VarianceThreshold(threshold=0.0)),
-        ("select_genes", SafeSelectKBest(k=number_of_genes)),
+    steps = [
+        (
+            "imputer",
+            SimpleImputer(
+                strategy="constant",
+                fill_value=0,
+            ),
+        ),
+        (
+            "log",
+            FunctionTransformer(
+                log1p_nonnegative,
+                validate=False,
+            ),
+        ),
+        (
+            "variance",
+            VarianceThreshold(0),
+        ),
+        (
+            "select",
+            SafeSelectKBest(k),
+        ),
     ]
 
     if model_name == "LogisticRegression":
-        gene_steps.append(("scale_genes", StandardScaler()))
 
-    gene_pipeline = Pipeline(gene_steps)
+        steps.append(
+            (
+                "scale",
+                StandardScaler(),
+            )
+        )
 
     transformers = [
-        ("genes", gene_pipeline, gene_columns),
+        (
+            "genes",
+            Pipeline(steps),
+            genes,
+        )
     ]
 
-    if numeric_metadata:
+    if numeric:
 
-        metadata_pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ])
+        transformers.append(
+            (
+                "metadata",
+                Pipeline([
+                    (
+                        "imputer",
+                        SimpleImputer(
+                            strategy="median",
+                        ),
+                    ),
+                    (
+                        "scale",
+                        StandardScaler(),
+                    ),
+                ]),
+                numeric,
+            )
+        )
 
-        transformers.append(("metadata", metadata_pipeline, numeric_metadata))
-
-    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    pre = ColumnTransformer(
+        transformers,
+        remainder="drop",
+    )
 
     if model_name == "LogisticRegression":
 
-        classifier = LogisticRegression(
+        clf = LogisticRegression(
             max_iter=5000,
             class_weight="balanced",
-            random_state=RANDOM_STATE,
+            random_state=SEED,
         )
 
     elif model_name == "RandomForest":
 
-        classifier = RandomForestClassifier(
+        clf = RandomForestClassifier(
             n_estimators=400,
             max_depth=5,
             class_weight="balanced",
-            random_state=RANDOM_STATE,
-            n_jobs=1,
-        )
-
-    elif model_name == "ExtraTrees":
-
-        classifier = ExtraTreesClassifier(
-            n_estimators=400,
-            max_depth=5,
-            class_weight="balanced",
-            random_state=RANDOM_STATE,
-            n_jobs=1,
+            random_state=SEED,
+            n_jobs=-1,
         )
 
     else:
-        raise ValueError(f"Unknown model: {model_name}")
+
+        clf = ExtraTreesClassifier(
+            n_estimators=400,
+            max_depth=5,
+            class_weight="balanced",
+            random_state=SEED,
+            n_jobs=-1,
+        )
 
     return Pipeline([
-        ("preprocessor", preprocessor),
-        ("classifier", classifier),
+        (
+            "preprocessor",
+            pre,
+        ),
+        (
+            "classifier",
+            clf,
+        ),
     ])
 
 
 # ============================================================
-# CHOOSE MODEL FOR ONE AMBIGUOUS GROUP
+# TRAIN MODEL FOR AMBIGUOUS HIERARCHICAL GROUP
 # ============================================================
 
-def fit_ambiguous_model(group_df, gene_columns, numeric_metadata):
+def fit_ambiguous(
+    group,
+    genes,
+    numeric,
+):
 
-    y = group_df[TARGET]
-    class_counts = y.value_counts()
-    smallest_class = int(class_counts.min())
+    y = (
+        group[TARGET]
+        .astype(str)
+    )
 
-    # Not enough examples for proper inner CV.
-    if smallest_class < 2:
+    smallest = int(
+        y.value_counts().min()
+    )
 
-        default_k = min(5, len(gene_columns))
+    # Too few examples for CV
+    if smallest < 2:
 
-        if default_k < 1:
-            return None, None, pd.DataFrame()
+        k = min(
+            5,
+            len(genes),
+        )
+
+        if k < 1:
+            return None, None
+
+        m = build_pipeline(
+            "ExtraTrees",
+            k,
+            genes,
+            numeric,
+        )
 
         try:
 
-            model = build_pipeline(
-                "ExtraTrees",
-                default_k,
-                gene_columns,
-                numeric_metadata,
+            m.fit(
+                group,
+                y,
             )
 
-            model.fit(group_df, y)
-
-            model_info = {
+            return m, {
                 "model": "ExtraTrees",
-                "number_of_genes": default_k,
-                "inner_accuracy": np.nan,
-                "inner_balanced_accuracy": np.nan,
-                "inner_macro_f1": np.nan,
-                "selection_status": "low_data_default_model",
+                "genes": k,
             }
 
-            return model, model_info, pd.DataFrame()
-
         except Exception:
-            return None, None, pd.DataFrame()
 
-    n_splits = min(INNER_MAX_SPLITS, smallest_class)
+            return None, None
 
-    inner_cv = StratifiedKFold(
-        n_splits=n_splits,
+    cv = StratifiedKFold(
+        n_splits=min(
+            INNER_MAX_SPLITS,
+            smallest,
+        ),
         shuffle=True,
-        random_state=RANDOM_STATE,
+        random_state=SEED,
     )
 
-    gene_counts = [k for k in GENE_COUNTS if k <= len(gene_columns)]
     results = []
 
-    for model_name in MODEL_NAMES:
+    for name in MODELS:
 
-        for k in gene_counts:
+        for k in [
+            x
+            for x in GENE_COUNTS
+            if x <= len(genes)
+        ]:
 
-            pipeline = build_pipeline(
-                model_name,
+            m = build_pipeline(
+                name,
                 k,
-                gene_columns,
-                numeric_metadata,
+                genes,
+                numeric,
             )
 
             try:
 
-                scores = cross_validate(
-                    pipeline,
-                    group_df,
+                s = cross_validate(
+                    m,
+                    group,
                     y,
-                    cv=inner_cv,
+                    cv=cv,
                     scoring={
                         "accuracy": "accuracy",
-                        "balanced_accuracy": "balanced_accuracy",
-                        "macro_f1": "f1_macro",
+                        "balanced": "balanced_accuracy",
+                        "f1": "f1_macro",
                     },
                     n_jobs=-1,
                     error_score="raise",
                 )
 
             except Exception:
+
                 continue
 
-            results.append({
-                "model": model_name,
-                "number_of_genes": k,
-                "accuracy": scores["test_accuracy"].mean(),
-                "accuracy_sd": scores["test_accuracy"].std(),
-                "balanced_accuracy": scores["test_balanced_accuracy"].mean(),
-                "balanced_accuracy_sd": scores["test_balanced_accuracy"].std(),
-                "macro_f1": scores["test_macro_f1"].mean(),
-                "macro_f1_sd": scores["test_macro_f1"].std(),
-            })
+            results.append([
+                name,
+                k,
+                s["test_accuracy"].mean(),
+                s["test_balanced"].mean(),
+                s["test_f1"].mean(),
+            ])
 
     if not results:
-        return None, None, pd.DataFrame()
 
-    results_df = pd.DataFrame(results)
+        return None, None
 
-    results_df = results_df.sort_values(
-        ["balanced_accuracy", "macro_f1", "number_of_genes"],
-        ascending=[False, False, True],
-    ).reset_index(drop=True)
-
-    best = results_df.iloc[0]
-
-    best_model = build_pipeline(
-        best["model"],
-        int(best["number_of_genes"]),
-        gene_columns,
-        numeric_metadata,
+    r = pd.DataFrame(
+        results,
+        columns=[
+            "model",
+            "genes",
+            "accuracy",
+            "balanced",
+            "macro_f1",
+        ],
+    ).sort_values(
+        [
+            "balanced",
+            "macro_f1",
+            "genes",
+        ],
+        ascending=[
+            False,
+            False,
+            True,
+        ],
     )
 
-    best_model.fit(group_df, y)
+    best = r.iloc[0]
 
-    model_info = {
-        "model": best["model"],
-        "number_of_genes": int(best["number_of_genes"]),
-        "inner_accuracy": best["accuracy"],
-        "inner_balanced_accuracy": best["balanced_accuracy"],
-        "inner_macro_f1": best["macro_f1"],
-        "selection_status": "cross_validated",
+    m = build_pipeline(
+        best.model,
+        int(best.genes),
+        genes,
+        numeric,
+    )
+
+    m.fit(
+        group,
+        y,
+    )
+
+    return m, {
+        "model": best.model,
+        "genes": int(best.genes),
     }
-
-    return best_model, model_info, results_df
 
 
 # ============================================================
 # BUILD HIERARCHICAL ROUTER
 # ============================================================
 
-def fit_router(train_df, gene_columns, numeric_metadata):
+def fit_router(
+    train,
+    genes,
+    numeric,
+):
 
     router = {
+
         "direct_section": {},
         "direct_ei": {},
         "models": {},
         "model_info": {},
         "section_majority": {},
-        "global_majority": train_df[TARGET].mode().iloc[0],
+
+        "global_majority": (
+            train[TARGET]
+            .mode()
+            .iloc[0]
+        ),
     }
 
-    routing_records = []
-    all_model_results = []
+    rows = []
 
-    for section, section_df in train_df.groupby("_section"):
+    for section, sdf in train.groupby(
+        "_section"
+    ):
 
-        section_counts = section_df[TARGET].value_counts()
-        section_labels = section_counts.index.tolist()
+        counts = (
+            sdf[TARGET]
+            .value_counts()
+        )
 
-        router["section_majority"][section] = section_counts.idxmax()
+        router[
+            "section_majority"
+        ][section] = counts.idxmax()
 
-        # Entire section contains only one cell type.
-        if len(section_labels) == 1:
+        # Entire section = one cell type
+        if len(counts) == 1:
 
-            label = section_labels[0]
-            router["direct_section"][section] = label
+            router[
+                "direct_section"
+            ][section] = counts.index[0]
 
-            routing_records.append({
-                "section": section,
-                "ei_group": "ALL",
-                "n_cells": len(section_df),
-                "n_cell_types": 1,
-                "cell_types": label,
-                "route_type": "direct_section",
-                "best_model": "",
-                "number_of_genes": np.nan,
-                "inner_accuracy": np.nan,
-                "inner_balanced_accuracy": np.nan,
-                "inner_macro_f1": np.nan,
-            })
+            rows.append([
+                section,
+                "ALL",
+                "direct_section",
+                counts.index[0],
+                "",
+                np.nan,
+            ])
 
             continue
 
-        # Section contains multiple labels, so split by E/I.
-        for ei_value, ei_df in section_df.groupby("_ei"):
+        # Otherwise split by E/I/NA
+        for ei, edf in sdf.groupby(
+            "_ei"
+        ):
 
-            ei_counts = ei_df[TARGET].value_counts()
-            ei_labels = ei_counts.index.tolist()
+            labels = (
+                edf[TARGET]
+                .value_counts()
+            )
 
-            key = (section, ei_value)
+            key = (
+                section,
+                ei,
+            )
 
-            # E/I subgroup contains only one type.
-            if len(ei_labels) == 1:
+            # One cell type in this subgroup
+            if len(labels) == 1:
 
-                label = ei_labels[0]
-                router["direct_ei"][key] = label
+                router[
+                    "direct_ei"
+                ][key] = labels.index[0]
 
-                routing_records.append({
-                    "section": section,
-                    "ei_group": ei_value,
-                    "n_cells": len(ei_df),
-                    "n_cell_types": 1,
-                    "cell_types": label,
-                    "route_type": "direct_section_EI",
-                    "best_model": "",
-                    "number_of_genes": np.nan,
-                    "inner_accuracy": np.nan,
-                    "inner_balanced_accuracy": np.nan,
-                    "inner_macro_f1": np.nan,
-                })
+                rows.append([
+                    section,
+                    ei,
+                    "direct_section_EI",
+                    labels.index[0],
+                    "",
+                    np.nan,
+                ])
 
                 continue
 
-            # Still ambiguous: model is required.
-            model, model_info, model_results = fit_ambiguous_model(
-                ei_df,
-                gene_columns,
-                numeric_metadata,
+            # Need classifier
+            m, info = fit_ambiguous(
+                edf,
+                genes,
+                numeric,
             )
 
-            cell_type_string = " | ".join(sorted(map(str, ei_labels)))
+            if m is None:
 
-            if model is None:
-
-                routing_records.append({
-                    "section": section,
-                    "ei_group": ei_value,
-                    "n_cells": len(ei_df),
-                    "n_cell_types": len(ei_labels),
-                    "cell_types": cell_type_string,
-                    "route_type": "section_majority_fallback",
-                    "best_model": "",
-                    "number_of_genes": np.nan,
-                    "inner_accuracy": np.nan,
-                    "inner_balanced_accuracy": np.nan,
-                    "inner_macro_f1": np.nan,
-                })
+                rows.append([
+                    section,
+                    ei,
+                    "section_majority_fallback",
+                    "",
+                    "",
+                    np.nan,
+                ])
 
                 continue
 
-            router["models"][key] = model
-            router["model_info"][key] = model_info
+            router[
+                "models"
+            ][key] = m
 
-            route_name = (
-                "subgroup_model"
-                if model_info["selection_status"] == "cross_validated"
-                else "low_data_subgroup_model"
-            )
+            router[
+                "model_info"
+            ][key] = info
 
-            routing_records.append({
-                "section": section,
-                "ei_group": ei_value,
-                "n_cells": len(ei_df),
-                "n_cell_types": len(ei_labels),
-                "cell_types": cell_type_string,
-                "route_type": route_name,
-                "best_model": model_info["model"],
-                "number_of_genes": model_info["number_of_genes"],
-                "inner_accuracy": model_info["inner_accuracy"],
-                "inner_balanced_accuracy": model_info["inner_balanced_accuracy"],
-                "inner_macro_f1": model_info["inner_macro_f1"],
-            })
+            rows.append([
+                section,
+                ei,
+                "subgroup_model",
+                " | ".join(
+                    sorted(
+                        labels.index.astype(str)
+                    )
+                ),
+                info["model"],
+                info["genes"],
+            ])
 
-            if len(model_results) > 0:
-
-                model_results = model_results.copy()
-                model_results["section"] = section
-                model_results["ei_group"] = ei_value
-
-                all_model_results.append(model_results)
-
-    routing_df = pd.DataFrame(routing_records)
-
-    if all_model_results:
-        model_results_df = pd.concat(all_model_results, ignore_index=True)
-    else:
-        model_results_df = pd.DataFrame()
-
-    return router, routing_df, model_results_df
-
-
-# ============================================================
-# PREDICT USING ROUTER
-# ============================================================
-
-def predict_with_router(router, data_df):
-
-    predictions = []
-    methods = []
-    chosen_models = []
-    chosen_gene_counts = []
-
-    for _, row in data_df.iterrows():
-
-        section = row["_section"]
-        ei_value = row["_ei"]
-        key = (section, ei_value)
-
-        if section in router["direct_section"]:
-
-            prediction = router["direct_section"][section]
-            method = "direct_section"
-            model_name = ""
-            gene_count = np.nan
-
-        elif key in router["direct_ei"]:
-
-            prediction = router["direct_ei"][key]
-            method = "direct_section_EI"
-            model_name = ""
-            gene_count = np.nan
-
-        elif key in router["models"]:
-
-            model = router["models"][key]
-            prediction = model.predict(pd.DataFrame([row]))[0]
-
-            info = router["model_info"][key]
-
-            method = (
-                "subgroup_model"
-                if info["selection_status"] == "cross_validated"
-                else "low_data_subgroup_model"
-            )
-
-            model_name = info["model"]
-            gene_count = info["number_of_genes"]
-
-        elif section in router["section_majority"]:
-
-            prediction = router["section_majority"][section]
-            method = "section_majority_fallback"
-            model_name = ""
-            gene_count = np.nan
-
-        else:
-
-            prediction = router["global_majority"]
-            method = "global_majority_fallback"
-            model_name = ""
-            gene_count = np.nan
-
-        predictions.append(prediction)
-        methods.append(method)
-        chosen_models.append(model_name)
-        chosen_gene_counts.append(gene_count)
-
-    return pd.DataFrame({
-        "prediction": predictions,
-        "prediction_method": methods,
-        "chosen_model": chosen_models,
-        "chosen_number_of_genes": chosen_gene_counts,
-    }, index=data_df.index)
-
-
-# ============================================================
-# OUTER CROSS-VALIDATION SPLITS
-# ============================================================
-
-def make_outer_splits(train_df):
-
-    y = train_df[TARGET]
-
-    if OUTER_MODE == "mouse":
-
-        if MOUSE_GROUP_COL not in train_df.columns:
-            raise ValueError(f"{MOUSE_GROUP_COL} was not found.")
-
-        groups = train_df[MOUSE_GROUP_COL].fillna("__NA__").astype(str)
-        n_splits = min(OUTER_SPLITS, groups.nunique())
-
-        if n_splits < 2:
-            raise ValueError("Not enough mice for grouped cross-validation.")
-
-        splitter = GroupKFold(n_splits=n_splits)
-
-        return (
-            list(splitter.split(train_df, y, groups)),
-            f"GroupKFold by {MOUSE_GROUP_COL} ({n_splits} folds)",
-        )
-
-    class_counts = y.value_counts()
-    smallest_class = int(class_counts.min())
-
-    if smallest_class >= 2:
-
-        n_splits = min(OUTER_SPLITS, smallest_class)
-
-        splitter = StratifiedKFold(
-            n_splits=n_splits,
-            shuffle=True,
-            random_state=RANDOM_STATE,
-        )
-
-        return (
-            list(splitter.split(train_df, y)),
-            f"StratifiedKFold ({n_splits} folds)",
-        )
-
-    n_splits = min(OUTER_SPLITS, len(train_df))
-
-    if n_splits < 2:
-        raise ValueError("Not enough cells for cross-validation.")
-
-    splitter = KFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=RANDOM_STATE,
+    routing = pd.DataFrame(
+        rows,
+        columns=[
+            "section",
+            "ei_group",
+            "route_type",
+            "cell_types",
+            "model",
+            "number_of_genes",
+        ],
     )
 
     return (
-        list(splitter.split(train_df)),
-        f"KFold ({n_splits} folds; stratification impossible)",
+        router,
+        routing,
     )
 
 
 # ============================================================
-# MODEL STABILITY ACROSS OUTER FOLDS
+# PREDICT WITH HIERARCHICAL ROUTER
 # ============================================================
 
-def calculate_model_stability(routing_df):
+def predict_router(
+    router,
+    data,
+):
 
-    if len(routing_df) == 0:
-        return pd.DataFrame()
+    pred = []
+    method = []
+    model_name = []
+    k = []
 
-    total_outer_folds = routing_df["outer_fold"].nunique()
+    for _, row in data.iterrows():
 
-    model_rows = routing_df[
-        routing_df["route_type"].isin([
-            "subgroup_model",
-            "low_data_subgroup_model",
+        section = row["_section"]
+        ei = row["_ei"]
+
+        key = (
+            section,
+            ei,
+        )
+
+        if section in router[
+            "direct_section"
+        ]:
+
+            p = router[
+                "direct_section"
+            ][section]
+
+            meth = "direct_section"
+            m = ""
+            n = np.nan
+
+        elif key in router[
+            "direct_ei"
+        ]:
+
+            p = router[
+                "direct_ei"
+            ][key]
+
+            meth = "direct_section_EI"
+            m = ""
+            n = np.nan
+
+        elif key in router[
+            "models"
+        ]:
+
+            p = router[
+                "models"
+            ][key].predict(
+                pd.DataFrame([row])
+            )[0]
+
+            info = router[
+                "model_info"
+            ][key]
+
+            meth = "subgroup_model"
+            m = info["model"]
+            n = info["genes"]
+
+        elif section in router[
+            "section_majority"
+        ]:
+
+            p = router[
+                "section_majority"
+            ][section]
+
+            meth = (
+                "section_majority_fallback"
+            )
+
+            m = ""
+            n = np.nan
+
+        else:
+
+            p = router[
+                "global_majority"
+            ]
+
+            meth = (
+                "global_majority_fallback"
+            )
+
+            m = ""
+            n = np.nan
+
+        pred.append(p)
+        method.append(meth)
+        model_name.append(m)
+        k.append(n)
+
+    return pd.DataFrame(
+        {
+            "prediction": pred,
+            "prediction_method": method,
+            "chosen_model": model_name,
+            "chosen_number_of_genes": k,
+        },
+        index=data.index,
+    )
+
+
+# ============================================================
+# IDENTIFY NA GROUP
+# ============================================================
+
+def is_na_group(s):
+
+    return (
+        s.astype(str)
+        .str.strip()
+        .str.lower()
+        .isin([
+            "__na__",
+            "na",
+            "nan",
+            "none",
+            "",
         ])
-    ].copy()
-
-    model_rows = model_rows[
-        model_rows["best_model"].notna()
-        & (model_rows["best_model"] != "")
-    ].copy()
-
-    if len(model_rows) == 0:
-        return pd.DataFrame()
-
-    model_rows["configuration"] = (
-        model_rows["best_model"].astype(str)
-        + " + "
-        + model_rows["number_of_genes"].fillna(-1).astype(int).astype(str)
-        + " genes"
     )
-
-    stability_records = []
-
-    for (section, ei_group), group in model_rows.groupby(["section", "ei_group"]):
-
-        model_counts = group["best_model"].value_counts()
-        configuration_counts = group["configuration"].value_counts()
-
-        most_common_model = model_counts.index[0]
-        model_wins = int(model_counts.iloc[0])
-
-        most_common_configuration = configuration_counts.index[0]
-        configuration_wins = int(configuration_counts.iloc[0])
-
-        folds_with_model = group["outer_fold"].nunique()
-
-        stability_records.append({
-            "section": section,
-            "ei_group": ei_group,
-            "total_outer_folds": total_outer_folds,
-            "folds_with_model": folds_with_model,
-            "most_common_cv_model": most_common_model,
-            "model_wins": model_wins,
-            "model_stability": model_wins / total_outer_folds,
-            "model_stability_when_modeled": model_wins / folds_with_model,
-            "most_common_cv_configuration": most_common_configuration,
-            "configuration_wins": configuration_wins,
-            "configuration_stability": configuration_wins / total_outer_folds,
-            "configuration_stability_when_modeled": configuration_wins / folds_with_model,
-        })
-
-    return pd.DataFrame(stability_records)
 
 
 # ============================================================
-# EVALUATE ENTIRE PIPELINE
+# NA GENE FEATURES
 # ============================================================
 
-def evaluate_full_pipeline(train_df, gene_columns, numeric_metadata, id_column):
+def log_genes(
+    df,
+    genes,
+):
 
-    print("\n" + "=" * 70)
-    print("FULL PIPELINE CROSS-VALIDATION")
-    print("=" * 70)
+    return np.log1p(
+        df[genes]
+        .apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+        .fillna(0)
+        .clip(lower=0)
+        .astype(float)
+    )
 
-    outer_splits, split_description = make_outer_splits(train_df)
 
-    print(f"\nOuter evaluation: {split_description}")
+def na_features(
+    df,
+    genes,
+    volume_median,
+):
 
-    all_predictions = []
-    all_routing = []
-    all_inner_results = []
+    X = log_genes(
+        df,
+        genes,
+    ).copy()
 
-    for fold_number, (train_index, validation_index) in enumerate(outer_splits, start=1):
+    X["volume"] = (
+        pd.to_numeric(
+            df["volume"],
+            errors="coerce",
+        )
+        .fillna(volume_median)
+        .to_numpy()
+    )
 
-        print("\n" + "-" * 70)
-        print(f"OUTER FOLD {fold_number}")
-        print("-" * 70)
+    return X
 
-        outer_train = train_df.iloc[train_index].copy()
-        outer_validation = train_df.iloc[validation_index].copy()
 
-        print(f"Training cells: {len(outer_train):,}")
-        print(f"Validation cells: {len(outer_validation):,}")
+# ============================================================
+# CALIBRATED NA EXTRATREES
+# ============================================================
 
-        router, routing_df, inner_results_df = fit_router(
-            outer_train,
-            gene_columns,
-            numeric_metadata,
+def calibrated_forest(y):
+
+    smallest = int(
+        pd.Series(y)
+        .value_counts()
+        .min()
+    )
+
+    cv = min(
+        3,
+        smallest,
+    )
+
+    if cv < 2:
+
+        raise ValueError(
+            "Not enough cells to calibrate NA classifier."
         )
 
-        prediction_info = predict_with_router(router, outer_validation)
+    base = ExtraTreesClassifier(
+        n_estimators=1000,
+        class_weight="balanced",
+        max_features="sqrt",
+        random_state=SEED,
+        n_jobs=-1,
+    )
 
-        fold_predictions = outer_validation[
-            [TARGET, "_section", "_ei"]
-        ].copy()
+    return CalibratedClassifierCV(
+        estimator=base,
+        method="sigmoid",
+        cv=cv,
+        n_jobs=-1,
+    )
 
-        fold_predictions["original_row_index"] = outer_validation.index
 
-        if id_column is not None and id_column in outer_validation.columns:
-            fold_predictions["cell_id"] = outer_validation[id_column]
+# ============================================================
+# FREQUENCY CORRECTION
+# ============================================================
 
-        fold_predictions["predicted_cell_type"] = prediction_info["prediction"]
-        fold_predictions["prediction_method"] = prediction_info["prediction_method"]
-        fold_predictions["chosen_model"] = prediction_info["chosen_model"]
-        fold_predictions["chosen_number_of_genes"] = prediction_info["chosen_number_of_genes"]
+def expected_counts(
+    freq,
+    n,
+):
 
-        fold_predictions["correct"] = (
-            fold_predictions[TARGET]
-            == fold_predictions["predicted_cell_type"]
+    x = freq * n
+
+    c = np.floor(
+        x
+    ).astype(int)
+
+    for i in np.argsort(
+        -(x - c)
+    )[
+        : n - c.sum()
+    ]:
+
+        c[i] += 1
+
+    return c
+
+
+def constrained_assign(
+    P,
+    labels,
+    c,
+):
+
+    slots = np.repeat(
+        np.arange(
+            len(labels)
+        ),
+        c,
+    )
+
+    r, s = linear_sum_assignment(
+        -np.log(
+            np.clip(
+                P[:, slots],
+                1e-12,
+                1,
+            )
         )
+    )
 
-        fold_predictions["outer_fold"] = fold_number
+    out = np.empty(
+        len(P),
+        dtype=object,
+    )
 
-        all_predictions.append(fold_predictions)
+    out[r] = np.array(
+        labels
+    )[slots[s]]
 
-        if len(routing_df) > 0:
+    return out
 
-            routing_df = routing_df.copy()
-            routing_df["outer_fold"] = fold_number
 
-            all_routing.append(routing_df)
+def frequency_correct(
+    out,
+    P,
+    classes,
+    y,
+    members,
+    pos,
+):
 
-        if len(inner_results_df) > 0:
+    members = [
+        m
+        for m in members
+        if m in classes
+    ]
 
-            inner_results_df = inner_results_df.copy()
-            inner_results_df["outer_fold"] = fold_number
+    if (
+        len(pos) == 0
+        or len(members) < 2
+    ):
+        return
 
-            all_inner_results.append(inner_results_df)
+    cols = [
+        np.where(
+            classes == m
+        )[0][0]
+        for m in members
+    ]
 
-        print(f"\nFold accuracy: {fold_predictions['correct'].mean():.3%}")
-
-        print("\nPrediction methods:")
-        print(fold_predictions["prediction_method"].value_counts().to_string())
-
-    # ========================================================
-    # COMBINE OUTER VALIDATION PREDICTIONS
-    # ========================================================
-
-    cv_predictions = pd.concat(all_predictions, ignore_index=True)
-
-    y_true = cv_predictions[TARGET]
-    y_pred = cv_predictions["predicted_cell_type"]
-
-    overall_accuracy = accuracy_score(y_true, y_pred)
-    overall_balanced_accuracy = balanced_accuracy_score(y_true, y_pred)
-    overall_macro_f1 = f1_score(y_true, y_pred, average="macro")
-
-    print("\n" + "=" * 70)
-    print("OVERALL HIERARCHICAL CLASSIFIER PERFORMANCE")
-    print("=" * 70)
-
-    print(f"\nCells evaluated: {len(cv_predictions):,}")
-    print(f"Overall accuracy:  {overall_accuracy:.3%}")
-    print(f"Balanced accuracy: {overall_balanced_accuracy:.3%}")
-    print(f"Macro F1:          {overall_macro_f1:.3%}")
-
-    # ========================================================
-    # PERFORMANCE BY ROUTING METHOD
-    # ========================================================
-
-    method_accuracy = (
-        cv_predictions
-        .groupby("prediction_method")
-        .agg(
-            cells=("correct", "size"),
-            correct=("correct", "sum"),
-            accuracy=("correct", "mean"),
+    freq = (
+        y[
+            y.isin(members)
+        ]
+        .value_counts(
+            normalize=True
         )
-        .reset_index()
-        .sort_values("cells", ascending=False)
     )
 
-    print("\n" + "-" * 70)
-    print("ACCURACY BY PREDICTION METHOD")
-    print("-" * 70)
-
-    print(method_accuracy.to_string(index=False))
-
-    # ========================================================
-    # PERFORMANCE BY CELL TYPE
-    # ========================================================
-
-    cell_type_accuracy = (
-        cv_predictions
-        .groupby(TARGET)
-        .agg(
-            cells=("correct", "size"),
-            correct=("correct", "sum"),
-            accuracy=("correct", "mean"),
-        )
-        .reset_index()
-        .sort_values("accuracy")
+    c = expected_counts(
+        np.array([
+            freq.get(
+                m,
+                0,
+            )
+            for m in members
+        ]),
+        len(pos),
     )
 
-    print("\n" + "-" * 70)
-    print("HARDEST CELL TYPES")
-    print("-" * 70)
-
-    print(cell_type_accuracy.head(20).to_string(index=False))
-
-    # ========================================================
-    # PERFORMANCE BY SECTION
-    # ========================================================
-
-    section_accuracy = (
-        cv_predictions
-        .groupby("_section")
-        .agg(
-            cells=("correct", "size"),
-            correct=("correct", "sum"),
-            accuracy=("correct", "mean"),
-        )
-        .reset_index()
-        .sort_values("accuracy")
+    out[pos] = constrained_assign(
+        P[pos][:, cols],
+        members,
+        c,
     )
 
-    # ========================================================
-    # CONFUSION MATRIX
-    # ========================================================
 
-    labels = sorted(y_true.unique().tolist())
+# ============================================================
+# LOAD PAIR-SPECIFIC OLIGO GENES
+# ============================================================
 
-    cm = confusion_matrix(
-        y_true,
-        y_pred,
-        labels=labels,
-    )
+def read_pair_genes(genes):
 
-    confusion_df = pd.DataFrame(
-        cm,
-        index=[f"Actual_{label}" for label in labels],
-        columns=[f"Predicted_{label}" for label in labels],
-    )
+    if PAIR_FILE.exists():
 
-    # ========================================================
-    # SAVE GENERAL CV RESULTS
-    # ========================================================
-
-    cv_predictions.to_csv(
-        OUTPUT_DIR / "overall_cv_predictions.csv",
-        index=False,
-    )
-
-    method_accuracy.to_csv(
-        OUTPUT_DIR / "accuracy_by_prediction_method.csv",
-        index=False,
-    )
-
-    cell_type_accuracy.to_csv(
-        OUTPUT_DIR / "accuracy_by_cell_type.csv",
-        index=False,
-    )
-
-    section_accuracy.to_csv(
-        OUTPUT_DIR / "accuracy_by_section.csv",
-        index=False,
-    )
-
-    confusion_df.to_csv(
-        OUTPUT_DIR / "overall_confusion_matrix.csv"
-    )
-
-    summary_df = pd.DataFrame({
-        "metric": [
-            "overall_accuracy",
-            "balanced_accuracy",
-            "macro_f1",
-        ],
-        "value": [
-            overall_accuracy,
-            overall_balanced_accuracy,
-            overall_macro_f1,
-        ],
-    })
-
-    summary_df.to_csv(
-        OUTPUT_DIR / "overall_cv_summary.csv",
-        index=False,
-    )
-
-    # ========================================================
-    # ROUTING + MODEL STABILITY
-    # ========================================================
-
-    if all_routing:
-
-        outer_routing_df = pd.concat(
-            all_routing,
-            ignore_index=True,
-        )
-
-        outer_routing_df.to_csv(
-            OUTPUT_DIR / "outer_cv_routing.csv",
-            index=False,
-        )
-
-        model_stability_df = calculate_model_stability(
-            outer_routing_df
-        )
-
-        model_stability_df.to_csv(
-            OUTPUT_DIR / "model_stability_across_outer_folds.csv",
-            index=False,
-        )
-
-        print("\n" + "-" * 70)
-        print("MODEL STABILITY ACROSS OUTER FOLDS")
-        print("-" * 70)
-
-        if len(model_stability_df) > 0:
-
-            display_stability = model_stability_df.copy()
-
-            for column in [
-                "model_stability",
-                "model_stability_when_modeled",
-                "configuration_stability",
-                "configuration_stability_when_modeled",
-            ]:
-                display_stability[column] = (
-                    display_stability[column] * 100
-                ).round(1)
-
-            print(display_stability.to_string(index=False))
+        file = PAIR_FILE
 
     else:
-        model_stability_df = pd.DataFrame()
 
-    if all_inner_results:
-
-        pd.concat(
-            all_inner_results,
-            ignore_index=True,
-        ).to_csv(
-            OUTPUT_DIR / "outer_cv_inner_model_results.csv",
-            index=False,
+        hits = list(
+            ROOT.rglob(
+                "difficult_cell_types_nearest_neighbor_genes*.csv"
+            )
         )
 
+        if not hits:
+
+            raise FileNotFoundError(
+                "Could not find difficult-cell-type gene CSV."
+            )
+
+        file = hits[0]
+
+    pg = pd.read_csv(file)
+
+    pg["FDR"] = pd.to_numeric(
+        pg["FDR"],
+        errors="coerce",
+    )
+
+    pg = pg[
+        (pg["FDR"] < 0.05)
+        & pg["gene"].isin(genes)
+    ].copy()
+
+    pg["pair"] = pg.apply(
+        lambda r: tuple(
+            sorted([
+                str(
+                    r["cell_type"]
+                ),
+                str(
+                    r["nearest_cell_type"]
+                ),
+            ])
+        ),
+        axis=1,
+    )
+
     return {
-        "accuracy": overall_accuracy,
-        "balanced_accuracy": overall_balanced_accuracy,
-        "macro_f1": overall_macro_f1,
-        "model_stability": model_stability_df,
+
+        pair: (
+            pg.loc[
+                pg["pair"] == pair
+            ]
+            .sort_values("FDR")[
+                "gene"
+            ]
+            .drop_duplicates()
+            .tolist()
+        )
+
+        for pair in [
+            PAIR1,
+            PAIR2,
+        ]
     }
 
 
 # ============================================================
-# TRAIN FINAL SYSTEM + PREDICT TEST DATA
+# TRAIN OLIGO SPECIALISTS
 # ============================================================
 
-def fit_final_and_predict(
-    train_df,
-    test_df,
-    gene_columns,
-    numeric_metadata,
-    id_column,
-    model_stability_df,
+def train_oligo_specialists(
+    train,
+    genes,
+    pair_genes,
 ):
 
-    print("\n" + "=" * 70)
-    print("TRAINING FINAL SYSTEM ON ALL LABELED DATA")
-    print("=" * 70)
-
-    final_router, final_routing_df, final_model_results = fit_router(
-        train_df,
-        gene_columns,
-        numeric_metadata,
+    G = log_genes(
+        train,
+        genes,
     )
 
-    # ========================================================
-    # COMPARE FINAL MODEL TO OUTER-CV CONSENSUS
-    # ========================================================
+    specialists = {}
 
-    if len(model_stability_df) > 0:
+    for pair, margin in [
+        (
+            PAIR1,
+            M1,
+        ),
+        (
+            PAIR2,
+            M2,
+        ),
+    ]:
 
-        final_comparison = final_routing_df.merge(
-            model_stability_df,
-            on=["section", "ei_group"],
-            how="left",
+        gs = pair_genes.get(
+            pair,
+            [],
         )
 
-        final_comparison["final_configuration"] = np.where(
-            final_comparison["best_model"].fillna("") != "",
-            final_comparison["best_model"].astype(str)
-            + " + "
-            + final_comparison["number_of_genes"].fillna(-1).astype(int).astype(str)
-            + " genes",
-            "",
-        )
-
-        final_comparison["final_model_matches_cv_mode"] = (
-            final_comparison["best_model"]
-            == final_comparison["most_common_cv_model"]
-        )
-
-        final_comparison["final_configuration_matches_cv_mode"] = (
-            final_comparison["final_configuration"]
-            == final_comparison["most_common_cv_configuration"]
-        )
-
-        final_comparison.to_csv(
-            OUTPUT_DIR / "final_vs_cv_model_stability.csv",
-            index=False,
-        )
-
-        modeled_comparison = final_comparison[
-            final_comparison["best_model"].fillna("") != ""
-        ].copy()
-
-        print("\n" + "-" * 70)
-        print("FINAL MODEL VS OUTER-CV CONSENSUS")
-        print("-" * 70)
-
-        if len(modeled_comparison) > 0:
-
-            columns = [
-                "section",
-                "ei_group",
-                "best_model",
-                "number_of_genes",
-                "most_common_cv_model",
-                "model_stability",
-                "most_common_cv_configuration",
-                "configuration_stability",
-                "final_model_matches_cv_mode",
-                "final_configuration_matches_cv_mode",
-            ]
-
-            print(modeled_comparison[columns].to_string(index=False))
-
-    else:
-
-        final_comparison = final_routing_df.copy()
-
-        final_comparison.to_csv(
-            OUTPUT_DIR / "final_vs_cv_model_stability.csv",
-            index=False,
-        )
-
-    # ========================================================
-    # SHOW FINAL ROUTING
-    # ========================================================
-
-    print("\nFinal routing structure:\n")
-
-    if len(final_routing_df) > 0:
-
-        columns = [
-            "section",
-            "ei_group",
-            "n_cells",
-            "n_cell_types",
-            "cell_types",
-            "route_type",
-            "best_model",
-            "number_of_genes",
-            "inner_balanced_accuracy",
+        idx = train.index[
+            train[TARGET]
+            .astype(str)
+            .isin(pair)
         ]
 
-        print(final_routing_df[columns].to_string(index=False))
+        if (
+            not gs
+            or train.loc[
+                idx,
+                TARGET,
+            ].nunique() != 2
+        ):
+            continue
 
-    # ========================================================
-    # PREDICT UNKNOWN TEST SET
-    # ========================================================
-
-    prediction_info = predict_with_router(
-        final_router,
-        test_df,
-    )
-
-    test_output = test_df.copy()
-
-    test_output[TARGET] = prediction_info["prediction"]
-    test_output["prediction_method"] = prediction_info["prediction_method"]
-    test_output["chosen_model"] = prediction_info["chosen_model"]
-    test_output["chosen_number_of_genes"] = prediction_info["chosen_number_of_genes"]
-
-    print("\n" + "-" * 70)
-    print("UNKNOWN TEST SET PREDICTION METHODS")
-    print("-" * 70)
-
-    print(test_output["prediction_method"].value_counts().to_string())
-
-    # ========================================================
-    # SAVE AUDIT FILE
-    # ========================================================
-
-    audit_output = test_output.drop(
-        columns=["_section", "_ei"],
-        errors="ignore",
-    )
-
-    audit_output.to_csv(
-        OUTPUT_DIR / "test_predictions_with_methods.csv",
-        index=False,
-    )
-
-    # ========================================================
-    # SUBMISSION FILE
-    # ========================================================
-
-    if id_column is not None and id_column in test_output.columns:
-        submission = test_output[[id_column, TARGET]].copy()
-    else:
-        submission = test_output[[TARGET]].copy()
-
-    submission.to_csv(
-        OUTPUT_DIR / "prediction.csv",
-        index=False,
-    )
-
-    # ========================================================
-    # SAVE FINAL ROUTING + MODEL RESULTS
-    # ========================================================
-
-    final_routing_df.to_csv(
-        OUTPUT_DIR / "final_routing_summary.csv",
-        index=False,
-    )
-
-    if len(final_model_results) > 0:
-
-        final_model_results.to_csv(
-            OUTPUT_DIR / "final_model_results_by_group.csv",
-            index=False,
+        m = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                class_weight="balanced",
+                max_iter=3000,
+                random_state=SEED,
+            ),
         )
+
+        m.fit(
+            G.loc[
+                idx,
+                gs,
+            ],
+            train.loc[
+                idx,
+                TARGET,
+            ].astype(str),
+        )
+
+        specialists[
+            pair
+        ] = (
+            m,
+            gs,
+            margin,
+        )
+
+    return specialists
+
+
+# ============================================================
+# TRAIN + PREDICT NA CELLS
+# ============================================================
+
+def predict_na(
+    na_train,
+    na_test,
+    genes,
+):
+
+    y = (
+        na_train[TARGET]
+        .astype(str)
+    )
+
+    volume_median = (
+        pd.to_numeric(
+            na_train["volume"],
+            errors="coerce",
+        )
+        .median()
+    )
+
+    print(
+        "\nTraining calibrated NA ExtraTrees..."
+    )
+
+    model = calibrated_forest(
+        y
+    )
+
+    model.fit(
+        na_features(
+            na_train,
+            genes,
+            volume_median,
+        ),
+        y,
+    )
+
+    P = model.predict_proba(
+        na_features(
+            na_test,
+            genes,
+            volume_median,
+        )
+    )
+
+    classes = model.classes_
+
+    raw = classes[
+        P.argmax(axis=1)
+    ]
+
+    confidence = P.max(
+        axis=1
+    )
+
+    # ========================================================
+    # FREQUENCY CORRECTION
+    # ========================================================
+
+    out = raw.copy()
+
+    frequency_correct(
+        out,
+        P,
+        classes,
+        y,
+        ASTRO,
+        np.where(
+            np.isin(
+                raw,
+                ASTRO,
+            )
+            & (
+                confidence
+                < ASTRO_T
+            )
+        )[0],
+    )
+
+    frequency_correct(
+        out,
+        P,
+        classes,
+        y,
+        OLIGO,
+        np.where(
+            np.isin(
+                raw,
+                OLIGO,
+            )
+            & (
+                confidence
+                < OLIGO_T
+            )
+        )[0],
+    )
+
+    # ========================================================
+    # OLIGO SPECIALISTS
+    # ========================================================
+
+    pair_genes = read_pair_genes(
+        genes
+    )
+
+    print(
+        "\nOligodendrocyte specialist genes:"
+    )
+
+    for pair, gs in pair_genes.items():
+
+        print(
+            f"{pair}: {gs}"
+        )
+
+    specialists = (
+        train_oligo_specialists(
+            na_train,
+            genes,
+            pair_genes,
+        )
+    )
+
+    Gtest = log_genes(
+        na_test,
+        genes,
+    )
+
+    top = np.argsort(
+        P,
+        axis=1,
+    )[
+        :, -2:
+    ][
+        :, ::-1
+    ]
+
+    specialist_changes = 0
+
+    for i, (
+        a,
+        b,
+    ) in enumerate(top):
+
+        pair = tuple(
+            sorted([
+                classes[a],
+                classes[b],
+            ])
+        )
+
+        if pair not in specialists:
+
+            continue
+
+        m, gs, margin = (
+            specialists[pair]
+        )
+
+        probability_gap = (
+            P[i, a]
+            - P[i, b]
+        )
+
+        if (
+            probability_gap
+            > margin
+        ):
+
+            continue
+
+        if out[i] not in pair:
+
+            continue
+
+        old = out[i]
+
+        out[i] = m.predict(
+            Gtest.iloc[
+                [i]
+            ][gs]
+        )[0]
+
+        specialist_changes += (
+            old != out[i]
+        )
+
+    final_probability = np.array([
+        P[
+            i,
+            np.where(
+                classes == label
+            )[0][0],
+        ]
+
+        for i, label
+        in enumerate(out)
+    ])
+
+    print(
+        f"NA specialist label changes: "
+        f"{specialist_changes:,}"
+    )
+
+    return (
+        out,
+        raw,
+        confidence,
+        final_probability,
+    )
 
 
 # ============================================================
@@ -1194,124 +1351,505 @@ def fit_final_and_predict(
 
 def main():
 
-    train_df = pd.read_csv(TRAIN_FILE)
-    test_df = pd.read_csv(TEST_FILE)
-
-    print("\n" + "=" * 70)
-    print("DATA")
-    print("=" * 70)
-
-    print(f"\nLabeled training cells: {len(train_df):,}")
-    print(f"Unknown test cells: {len(test_df):,}")
-
-    if TARGET not in train_df.columns:
-        raise ValueError(f"{TARGET} is missing from training data.")
-
-    for column in [SECTION_COL, EI_COL]:
-
-        if column not in train_df.columns or column not in test_df.columns:
-            raise ValueError(f"{column} must exist in both train and test data.")
-
-    train_df = prepare_dataframe(train_df)
-    test_df = prepare_dataframe(test_df)
-
-    id_column = find_id_column(train_df)
-
-    print(f"\nCell ID column: {id_column}")
-
-    gene_columns = find_gene_columns(
-        train_df,
-        test_df,
-        id_column,
+    print(
+        "\n"
+        + "=" * 70
     )
 
-    print(f"Gene columns shared between train and test: {len(gene_columns):,}")
+    print(
+        "LOAD DATA"
+    )
 
-    for gene in gene_columns:
+    print(
+        "=" * 70
+    )
 
-        train_df[gene] = pd.to_numeric(
-            train_df[gene],
+    train = pd.read_csv(
+        TRAIN_FILE
+    )
+
+    test = pd.read_csv(
+        TEST_FILE
+    )
+
+    print(
+        f"Training cells: "
+        f"{len(train):,}"
+    )
+
+    print(
+        f"Test cells:     "
+        f"{len(test):,}"
+    )
+
+    if TARGET not in train.columns:
+
+        raise ValueError(
+            f"{TARGET} missing from training data."
+        )
+
+    for col in [
+        SECTION_COL,
+        EI_COL,
+    ]:
+
+        if (
+            col not in train.columns
+            or col not in test.columns
+        ):
+
+            raise ValueError(
+                f"{col} must exist in train and test."
+            )
+
+    # Remove target from unknown test data if present
+    if TARGET in test.columns:
+
+        test = test.drop(
+            columns=[
+                TARGET
+            ]
+        )
+
+    train = prepare(
+        train
+    )
+
+    test = prepare(
+        test
+    )
+
+    id_col = id_column(
+        train
+    )
+
+    genes = gene_columns(
+        train,
+        test,
+        id_col,
+    )
+
+    print(
+        f"Cell ID column: "
+        f"{id_col}"
+    )
+
+    print(
+        f"Shared genes:   "
+        f"{len(genes)}"
+    )
+
+    # Numeric genes
+    for g in genes:
+
+        train[g] = pd.to_numeric(
+            train[g],
             errors="coerce",
         ).fillna(0)
 
-        test_df[gene] = pd.to_numeric(
-            test_df[gene],
+        test[g] = pd.to_numeric(
+            test[g],
             errors="coerce",
         ).fillna(0)
 
-    numeric_metadata = [
-        column
-        for column in NUMERIC_METADATA
-        if column in train_df.columns and column in test_df.columns
+    numeric = [
+        c
+        for c in NUMERIC_METADATA
+        if c in train.columns
+        and c in test.columns
     ]
 
-    print(f"Numeric metadata used: {numeric_metadata}")
+    for c in numeric:
 
-    for column in numeric_metadata:
-
-        train_df[column] = pd.to_numeric(
-            train_df[column],
+        train[c] = pd.to_numeric(
+            train[c],
             errors="coerce",
         )
 
-        test_df[column] = pd.to_numeric(
-            test_df[column],
+        test[c] = pd.to_numeric(
+            test[c],
             errors="coerce",
         )
 
     # ========================================================
-    # STEP 1: CROSS-VALIDATE THE ENTIRE HIERARCHICAL SYSTEM
+    # TRAIN HIERARCHICAL MODEL
     # ========================================================
 
-    evaluation_results = evaluate_full_pipeline(
-        train_df,
-        gene_columns,
-        numeric_metadata,
-        id_column,
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "TRAINING HIERARCHICAL MODEL"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    router, routing = fit_router(
+        train,
+        genes,
+        numeric,
+    )
+
+    routing.to_csv(
+        OUT
+        / "hierarchical_routing.csv",
+        index=False,
+    )
+
+    prediction_info = predict_router(
+        router,
+        test,
     )
 
     # ========================================================
-    # STEP 2: TRAIN FINAL SYSTEM ON ALL LABELED DATA
+    # IDENTIFY NA CELLS
     # ========================================================
 
-    fit_final_and_predict(
-        train_df,
-        test_df,
-        gene_columns,
-        numeric_metadata,
-        id_column,
-        evaluation_results["model_stability"],
+    train_na = is_na_group(
+        train["_ei"]
+    )
+
+    test_na = is_na_group(
+        test["_ei"]
+    )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "NA MODEL"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"NA training cells: "
+        f"{train_na.sum():,}"
+    )
+
+    print(
+        f"NA test cells:     "
+        f"{test_na.sum():,}"
+    )
+
+    raw_na = np.array(
+        [],
+        dtype=object,
+    )
+
+    conf_na = np.array(
+        [],
+        dtype=float,
+    )
+
+    final_prob = np.array(
+        [],
+        dtype=float,
     )
 
     # ========================================================
-    # FINAL SUMMARY
+    # BEST NA MODEL OVERRIDE
     # ========================================================
 
-    print("\n" + "=" * 70)
-    print("FINISHED")
-    print("=" * 70)
+    if (
+        train_na.sum() > 0
+        and test_na.sum() > 0
+    ):
 
-    print(f"\nCross-validated overall accuracy: {evaluation_results['accuracy']:.3%}")
-    print(f"Cross-validated balanced accuracy: {evaluation_results['balanced_accuracy']:.3%}")
-    print(f"Cross-validated macro F1: {evaluation_results['macro_f1']:.3%}")
+        (
+            final_na,
+            raw_na,
+            conf_na,
+            final_prob,
+        ) = predict_na(
+            train.loc[
+                train_na
+            ].copy(),
+            test.loc[
+                test_na
+            ].copy(),
+            genes,
+        )
 
-    print(f"\nResults saved in:\n{OUTPUT_DIR}")
+        prediction_info.loc[
+            test_na,
+            "prediction",
+        ] = final_na
 
-    print("\nImportant output files:")
-    print("  overall_cv_summary.csv")
-    print("  overall_cv_predictions.csv")
-    print("  accuracy_by_prediction_method.csv")
-    print("  accuracy_by_cell_type.csv")
-    print("  accuracy_by_section.csv")
-    print("  overall_confusion_matrix.csv")
-    print("  outer_cv_routing.csv")
-    print("  outer_cv_inner_model_results.csv")
-    print("  model_stability_across_outer_folds.csv")
-    print("  final_vs_cv_model_stability.csv")
-    print("  final_routing_summary.csv")
-    print("  final_model_results_by_group.csv")
-    print("  test_predictions_with_methods.csv")
-    print("  prediction.csv")
+        prediction_info.loc[
+            test_na,
+            "prediction_method",
+        ] = (
+            "calibrated_NA_best_accuracy"
+        )
+
+        prediction_info.loc[
+            test_na,
+            "chosen_model",
+        ] = (
+            "CalibratedExtraTrees"
+            "+frequency"
+            "+oligo_specialists"
+        )
+
+        prediction_info.loc[
+            test_na,
+            "chosen_number_of_genes",
+        ] = len(genes)
+
+    # ========================================================
+    # FULL AUDIT FILE
+    # ========================================================
+
+    audit = test.copy()
+
+    audit[TARGET] = (
+        prediction_info[
+            "prediction"
+        ]
+    )
+
+    audit[
+        "prediction_method"
+    ] = prediction_info[
+        "prediction_method"
+    ]
+
+    audit[
+        "chosen_model"
+    ] = prediction_info[
+        "chosen_model"
+    ]
+
+    audit[
+        "chosen_number_of_genes"
+    ] = prediction_info[
+        "chosen_number_of_genes"
+    ]
+
+    # ========================================================
+    # IMPORTANT FIX:
+    # raw_na_prediction must be object/string dtype
+    # ========================================================
+
+    audit[
+        "raw_na_prediction"
+    ] = pd.Series(
+        pd.NA,
+        index=audit.index,
+        dtype="object",
+    )
+
+    audit[
+        "raw_na_confidence"
+    ] = np.nan
+
+    audit[
+        "final_na_base_probability"
+    ] = np.nan
+
+    if test_na.sum() > 0:
+
+        audit.loc[
+            test_na,
+            "raw_na_prediction",
+        ] = np.asarray(
+            raw_na,
+            dtype=object,
+        )
+
+        audit.loc[
+            test_na,
+            "raw_na_confidence",
+        ] = np.asarray(
+            conf_na,
+            dtype=float,
+        )
+
+        audit.loc[
+            test_na,
+            "final_na_base_probability",
+        ] = np.asarray(
+            final_prob,
+            dtype=float,
+        )
+
+    audit_out = audit.drop(
+        columns=[
+            "_section",
+            "_ei",
+        ],
+        errors="ignore",
+    )
+
+    audit_out.to_csv(
+        OUT
+        / "test_predictions_with_details.csv",
+        index=False,
+    )
+
+    # ========================================================
+    # FINAL SUBMISSION
+    # ========================================================
+
+    if (
+        id_col is not None
+        and id_col in audit.columns
+    ):
+
+        submission = audit[
+            [
+                id_col,
+                TARGET,
+            ]
+        ].copy()
+
+    else:
+
+        submission = audit[
+            [
+                TARGET,
+            ]
+        ].copy()
+
+    submission.to_csv(
+        OUT
+        / "prediction.csv",
+        index=False,
+    )
+
+    # ========================================================
+    # TRAIN VS TEST FREQUENCIES
+    # ========================================================
+
+    train_freq = (
+        train[TARGET]
+        .astype(str)
+        .value_counts(
+            normalize=True
+        )
+        .rename(
+            "train_frequency"
+        )
+    )
+
+    predicted_freq = (
+        submission[TARGET]
+        .astype(str)
+        .value_counts(
+            normalize=True
+        )
+        .rename(
+            "predicted_test_frequency"
+        )
+    )
+
+    frequency_comparison = pd.concat(
+        [
+            train_freq,
+            predicted_freq,
+        ],
+        axis=1,
+    ).fillna(0)
+
+    frequency_comparison[
+        "difference"
+    ] = (
+        frequency_comparison[
+            "predicted_test_frequency"
+        ]
+        - frequency_comparison[
+            "train_frequency"
+        ]
+    )
+
+    frequency_comparison.to_csv(
+        OUT
+        / "class_frequency_comparison.csv"
+    )
+
+    # ========================================================
+    # FINISHED
+    # ========================================================
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "FINISHED"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "\nPrediction methods:"
+    )
+
+    print(
+        audit[
+            "prediction_method"
+        ]
+        .value_counts()
+        .to_string()
+    )
+
+    print(
+        "\nFinal predicted cell types:"
+    )
+
+    print(
+        submission[
+            TARGET
+        ]
+        .value_counts()
+        .to_string()
+    )
+
+    print(
+        "\nTrain vs predicted-test frequencies:"
+    )
+
+    print(
+        frequency_comparison
+        .round(4)
+        .to_string()
+    )
+
+    print(
+        "\nOUTPUT FILES"
+    )
+
+    print(
+        f"Final prediction: "
+        f"{OUT/'prediction.csv'}"
+    )
+
+    print(
+        f"Detailed audit:   "
+        f"{OUT/'test_predictions_with_details.csv'}"
+    )
+
+    print(
+        f"Frequencies:      "
+        f"{OUT/'class_frequency_comparison.csv'}"
+    )
+
+    print(
+        f"Routing:          "
+        f"{OUT/'hierarchical_routing.csv'}"
+    )
 
 
 # ============================================================

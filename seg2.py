@@ -1,70 +1,27 @@
 from pathlib import Path
-from collections import Counter
 
 import numpy as np
 import pandas as pd
 
-from sklearn.base import (
-    BaseEstimator,
-    TransformerMixin,
-    clone,
-)
-
-from sklearn.model_selection import (
-    RepeatedStratifiedKFold,
-    cross_validate,
-)
-
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
 from sklearn.pipeline import Pipeline
-
-from sklearn.preprocessing import (
-    StandardScaler,
-    FunctionTransformer,
-)
-
-from sklearn.feature_selection import (
-    f_classif,
-    VarianceThreshold,
-)
-
+from sklearn.preprocessing import StandardScaler, FunctionTransformer
+from sklearn.feature_selection import f_classif, VarianceThreshold
 from sklearn.linear_model import LogisticRegression
-
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    ExtraTreesClassifier,
-)
-
-from sklearn.tree import (
-    DecisionTreeClassifier,
-    export_text,
-)
-
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    f1_score,
-    confusion_matrix,
-)
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix
 
 
 # ============================================================
-# FILE PATHS
+# FILES
 # ============================================================
 
-INPUT_FILE = Path(
-    "/Users/abigailwaryanka/Desktop/"
-    "Hackathon-Summer-2026/segments/segment_19.csv"
-)
+TRAIN_FILE = Path("/Users/abigailwaryanka/Desktop/Hackathon-Summer-2026/segments/segment_NA.csv")
+TEST_FILE = Path("/Users/abigailwaryanka/Desktop/Hackathon-Summer-2026/data/full_test.csv")
 
-OUTPUT_DIR = Path(
-    "/Users/abigailwaryanka/Desktop/"
-    "Hackathon-Summer-2026/segment_19_analysis"
-)
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+OUTPUT_DIR = Path("/Users/abigailwaryanka/Desktop/Hackathon-Summer-2026/segment_NA_frequency")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -72,110 +29,356 @@ OUTPUT_DIR.mkdir(
 # ============================================================
 
 TARGET = "MERFISH_cell_type_annotation"
+DATASET_COL = "Datasets"
+AP_COL = "AP_position"
 
 RANDOM_STATE = 42
-
 N_SPLITS = 5
-
 N_REPEATS = 5
 
+GENE_COUNTS = [1, 2, 3, 5, 10, 20, 40]
+
+# alpha = 0 means completely ignore the frequency prior.
+ALPHAS = [0.0, 0.25, 0.5, 1.0]
+
+# Controls how strongly small Dataset + AP groups are shrunk
+# toward the overall NA cell-type frequencies.
+#
+# Larger number = trust tiny groups less.
+PRIOR_STRENGTH = 20
+
 
 # ============================================================
-# SAFE SELECT K BEST
+# SAFE FEATURE SELECTION
 # ============================================================
 
-class SafeSelectKBest(
-    BaseEstimator,
-    TransformerMixin,
-):
+class SafeSelectKBest(BaseEstimator, TransformerMixin):
 
     def __init__(self, k=10):
-
         self.k = k
 
-
     def fit(self, X, y):
-
         X = np.asarray(X)
 
-        number_of_features = X.shape[1]
+        if X.shape[1] == 0:
+            raise ValueError("No genes remain after variance filtering.")
 
+        self.k_ = min(self.k, X.shape[1])
 
-        # Never request more genes than exist
-        self.k_ = min(
-            self.k,
-            number_of_features,
-        )
+        scores, p_values = f_classif(X, y)
 
-
-        # Calculate ANOVA F-score
-        scores, p_values = f_classif(
-            X,
-            y,
-        )
-
-
-        # Replace invalid scores so they cannot be selected
-        scores = np.nan_to_num(
+        self.scores_ = np.nan_to_num(
             scores,
             nan=-np.inf,
             posinf=np.finfo(float).max,
             neginf=-np.inf,
         )
 
-
-        self.scores_ = scores
-
         self.pvalues_ = p_values
 
-
-        # Rank highest F-score first
-        ranked_indices = np.argsort(
-            scores
-        )[::-1]
-
-
-        self.selected_indices_ = np.sort(
-            ranked_indices[
-                :self.k_
-            ]
-        )
-
+        ranked = np.argsort(self.scores_)[::-1]
+        self.selected_indices_ = np.sort(ranked[:self.k_])
 
         return self
 
-
     def transform(self, X):
+        return np.asarray(X)[:, self.selected_indices_]
 
-        X = np.asarray(X)
-
-        return X[
-            :,
-            self.selected_indices_
-        ]
-
-
-    def get_support(
-        self,
-        indices=False,
-    ):
+    def get_support(self, indices=False):
 
         if indices:
-
             return self.selected_indices_
 
-
-        mask = np.zeros(
-            len(self.scores_),
-            dtype=bool,
-        )
-
-        mask[
-            self.selected_indices_
-        ] = True
-
+        mask = np.zeros(len(self.scores_), dtype=bool)
+        mask[self.selected_indices_] = True
 
         return mask
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean_group_value(value):
+
+    if pd.isna(value):
+        return "__NA__"
+
+    try:
+        number = float(value)
+
+        if number.is_integer():
+            return str(int(number))
+
+    except (ValueError, TypeError):
+        pass
+
+    return str(value).strip()
+
+
+def prepare_keys(df):
+
+    df = df.copy()
+
+    df["_dataset_key"] = df[DATASET_COL].apply(clean_group_value)
+    df["_ap_key"] = df[AP_COL].apply(clean_group_value)
+
+    return df
+
+
+def log1p_nonnegative(X):
+    X = np.asarray(X, dtype=float)
+    return np.log1p(np.clip(X, 0, None))
+
+
+def find_id_column(df):
+
+    first_column = df.columns[0]
+
+    if str(first_column).startswith("Unnamed:") or df[first_column].nunique() == len(df):
+        return first_column
+
+    possible_ids = [
+        "identity_number",
+        "Identity",
+        "identity",
+        "cell_id",
+        "Cell_ID",
+        "ID",
+        "id",
+    ]
+
+    return next((column for column in possible_ids if column in df.columns), None)
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+models = {
+    "LogisticRegression": LogisticRegression(
+        max_iter=5000,
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+    ),
+
+    "RandomForest": RandomForestClassifier(
+        n_estimators=300,
+        max_depth=4,
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    ),
+
+    "ExtraTrees": ExtraTreesClassifier(
+        n_estimators=300,
+        max_depth=4,
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    ),
+}
+
+
+def build_pipeline(model_name, number_of_genes):
+
+    steps = [
+        ("log_transform", FunctionTransformer(log1p_nonnegative, validate=False)),
+        ("remove_constant", VarianceThreshold(threshold=0.0)),
+        ("feature_selection", SafeSelectKBest(k=number_of_genes)),
+    ]
+
+    if model_name == "LogisticRegression":
+        steps.append(("scaler", StandardScaler()))
+
+    steps.append(("classifier", clone(models[model_name])))
+
+    return Pipeline(steps)
+
+
+# ============================================================
+# CREATE SMOOTHED DATASET + AP FREQUENCY PRIORS
+# ============================================================
+
+def make_frequency_priors(reference_df, classes):
+
+    global_counts = reference_df[TARGET].value_counts()
+    total_cells = len(reference_df)
+
+    global_frequency = {
+        cell_type: global_counts.get(cell_type, 0) / total_cells
+        for cell_type in classes
+    }
+
+    group_priors = {}
+    group_counts = {}
+
+    for key, group in reference_df.groupby(["_dataset_key", "_ap_key"]):
+
+        counts = group[TARGET].value_counts()
+        n = len(group)
+
+        group_counts[key] = {
+            cell_type: int(counts.get(cell_type, 0))
+            for cell_type in classes
+        }
+
+        group_priors[key] = {
+            cell_type: (
+                counts.get(cell_type, 0)
+                + PRIOR_STRENGTH * global_frequency[cell_type]
+            ) / (n + PRIOR_STRENGTH)
+            for cell_type in classes
+        }
+
+    return global_frequency, group_priors, group_counts
+
+
+# ============================================================
+# FREQUENCY-WEIGHTED PREDICTION
+# ============================================================
+
+def frequency_weighted_predict(model, reference_df, prediction_df, gene_columns, alpha):
+
+    probabilities = model.predict_proba(prediction_df[gene_columns])
+    classes = model.named_steps["classifier"].classes_
+
+    global_frequency, group_priors, _ = make_frequency_priors(
+        reference_df,
+        classes,
+    )
+
+    records = []
+
+    for i, (_, row) in enumerate(prediction_df.iterrows()):
+
+        key = (
+            row["_dataset_key"],
+            row["_ap_key"],
+        )
+
+        model_probabilities = probabilities[i]
+
+        normal_index = np.argmax(model_probabilities)
+        normal_prediction = classes[normal_index]
+        normal_probability = model_probabilities[normal_index]
+
+        if key in group_priors:
+            priors = np.array([group_priors[key][cell_type] for cell_type in classes])
+            prior_source = "dataset_AP"
+        else:
+            priors = np.array([global_frequency[cell_type] for cell_type in classes])
+            prior_source = "global_frequency"
+
+        weighted_scores = model_probabilities * np.power(priors, alpha)
+
+        if weighted_scores.sum() > 0:
+            weighted_probabilities = weighted_scores / weighted_scores.sum()
+        else:
+            weighted_probabilities = model_probabilities
+
+        weighted_index = np.argmax(weighted_probabilities)
+        weighted_prediction = classes[weighted_index]
+
+        records.append({
+            "normal_prediction": normal_prediction,
+            "weighted_prediction": weighted_prediction,
+            "prediction_changed": normal_prediction != weighted_prediction,
+            "normal_probability": normal_probability,
+            "model_probability_for_weighted_class": model_probabilities[weighted_index],
+            "training_frequency_prior": priors[weighted_index],
+            "weighted_probability": weighted_probabilities[weighted_index],
+            "prior_source": prior_source,
+        })
+
+    return pd.DataFrame(records, index=prediction_df.index)
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def calculate_metrics(y_true, y_pred):
+
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+    }
+
+
+# ============================================================
+# TEST ONE MODEL + GENE COUNT ACROSS ALL ALPHAS
+# ============================================================
+
+def evaluate_model_configuration(df, gene_columns, model_name, k):
+
+    class_counts = df[TARGET].value_counts()
+    n_splits = min(N_SPLITS, int(class_counts.min()))
+
+    if n_splits < 2:
+        return []
+
+    cv = RepeatedStratifiedKFold(
+        n_splits=n_splits,
+        n_repeats=N_REPEATS,
+        random_state=RANDOM_STATE,
+    )
+
+    alpha_results = {
+        alpha: []
+        for alpha in ALPHAS
+    }
+
+    for train_index, validation_index in cv.split(df, df[TARGET]):
+
+        train_fold = df.iloc[train_index].copy()
+        validation_fold = df.iloc[validation_index].copy()
+
+        pipeline = build_pipeline(model_name, k)
+
+        try:
+            pipeline.fit(train_fold[gene_columns], train_fold[TARGET])
+
+        except Exception:
+            return []
+
+        for alpha in ALPHAS:
+
+            prediction_info = frequency_weighted_predict(
+                pipeline,
+                train_fold,
+                validation_fold,
+                gene_columns,
+                alpha,
+            )
+
+            metrics = calculate_metrics(
+                validation_fold[TARGET],
+                prediction_info["weighted_prediction"],
+            )
+
+            alpha_results[alpha].append(metrics)
+
+    results = []
+
+    for alpha in ALPHAS:
+
+        fold_df = pd.DataFrame(alpha_results[alpha])
+
+        results.append({
+            "model": model_name,
+            "number_of_genes": k,
+            "alpha": alpha,
+            "accuracy_mean": fold_df["accuracy"].mean(),
+            "accuracy_sd": fold_df["accuracy"].std(),
+            "balanced_accuracy_mean": fold_df["balanced_accuracy"].mean(),
+            "balanced_accuracy_sd": fold_df["balanced_accuracy"].std(),
+            "macro_f1_mean": fold_df["macro_f1"].mean(),
+            "macro_f1_sd": fold_df["macro_f1"].std(),
+        })
+
+    return results
 
 
 # ============================================================
@@ -183,74 +386,91 @@ class SafeSelectKBest(
 # ============================================================
 
 print("\n" + "=" * 70)
-print("LOADING SEGMENT DATA")
+print("LOADING DATA")
 print("=" * 70)
 
+train_df = pd.read_csv(TRAIN_FILE)
+test_df = pd.read_csv(TEST_FILE)
 
-df = pd.read_csv(
-    INPUT_FILE
-)
+if TARGET not in train_df.columns:
+    raise ValueError(f"{TARGET} was not found in training data.")
 
+for column in [DATASET_COL, AP_COL]:
 
-print(
-    f"\nNumber of cells: "
-    f"{len(df):,}"
-)
+    if column not in train_df.columns:
+        raise ValueError(f"{column} was not found in training data.")
 
-print(
-    f"Number of columns: "
-    f"{len(df.columns):,}"
-)
+    if column not in test_df.columns:
+        raise ValueError(f"{column} was not found in test data.")
+
+train_df = train_df[train_df[TARGET].notna()].copy().reset_index(drop=True)
 
 
 # ============================================================
-# CHECK TARGET
+# KEEP ONLY NA CELLS FROM TEST
 # ============================================================
 
-if TARGET not in df.columns:
+if "Segment" in test_df.columns:
 
-    raise ValueError(
-        f"{TARGET} was not found."
+    segment = test_df["Segment"]
+
+    na_mask = (
+        segment.isna()
+        | segment.astype(str).str.strip().str.upper().eq("NA")
     )
 
+    test_df = test_df[na_mask].copy().reset_index(drop=True)
+
 
 # ============================================================
-# CELL TYPE COUNTS
+# DATASET + AP KEYS
 # ============================================================
+
+train_df = prepare_keys(train_df)
+test_df = prepare_keys(test_df)
+
+print(f"\nTraining NA cells: {len(train_df):,}")
+print(f"Test NA cells: {len(test_df):,}")
+
+
+# ============================================================
+# ID COLUMNS
+# ============================================================
+
+TRAIN_ID = find_id_column(train_df)
+TEST_ID = find_id_column(test_df)
+
+if TRAIN_ID is None:
+    train_df["_identity_number"] = train_df.index
+    TRAIN_ID = "_identity_number"
+
+if TEST_ID is None:
+    test_df["_identity_number"] = test_df.index
+    TEST_ID = "_identity_number"
+
+print(f"Training identity column: {TRAIN_ID}")
+print(f"Test identity column: {TEST_ID}")
+
+
+# ============================================================
+# CELL TYPES
+# ============================================================
+
+cell_types = list(pd.unique(train_df[TARGET]))
+class_counts = train_df[TARGET].value_counts()
 
 print("\nCell types:\n")
+print(class_counts.to_string())
 
-print(
-    df[TARGET]
-    .value_counts()
-    .to_string()
-)
+smallest_class = int(class_counts.min())
+actual_splits = min(N_SPLITS, smallest_class)
 
-
-cell_types = (
-    df[TARGET]
-    .dropna()
-    .unique()
-)
-
-
-if len(cell_types) != 2:
-
-    raise ValueError(
-        f"This script expects exactly 2 cell types, "
-        f"but found {len(cell_types)}."
-    )
-
-
-print(
-    f"\nComparing:\n"
-    f"  {cell_types[0]}\n"
-    f"  {cell_types[1]}"
-)
+if actual_splits < 2:
+    raise ValueError("At least one cell type has fewer than 2 cells.")
 
 
 # ============================================================
-# DEFINE METADATA COLUMNS
+# FIND GENE COLUMNS
 # ============================================================
 
 metadata_columns = [
@@ -265,1479 +485,580 @@ metadata_columns = [
     "Mouse_ID",
     "AP_position",
     "Section_ID",
+    "cell_type_frequency",
+    "normalized_frequency",
+    "frequency",
     TARGET,
+    TRAIN_ID,
+    "_dataset_key",
+    "_ap_key",
 ]
-
-
-# ============================================================
-# FIND CELL ID COLUMN
-# ============================================================
-
-first_column = df.columns[0]
-
-
-if (
-    str(first_column).startswith("Unnamed:")
-    or df[first_column].nunique() == len(df)
-):
-
-    if first_column not in metadata_columns:
-
-        metadata_columns.append(
-            first_column
-        )
-
-
-    print(
-        f"\nIgnoring cell ID column: "
-        f"{first_column}"
-    )
-
-
-# ============================================================
-# FIND GENE COLUMNS
-# ============================================================
 
 gene_columns = [
     column
-    for column in df.columns
+    for column in train_df.columns
     if column not in metadata_columns
+    and column in test_df.columns
 ]
-
-
-print(
-    f"\nPotential gene columns: "
-    f"{len(gene_columns):,}"
-)
-
-
-# ============================================================
-# CONVERT GENES TO NUMERIC
-# ============================================================
 
 for gene in gene_columns:
 
-    df[gene] = pd.to_numeric(
-        df[gene],
+    train_df[gene] = pd.to_numeric(
+        train_df[gene],
         errors="coerce",
     ).fillna(0)
 
-
-# ============================================================
-# REMOVE GENES CONSTANT ACROSS ENTIRE SEGMENT
-# ============================================================
+    test_df[gene] = pd.to_numeric(
+        test_df[gene],
+        errors="coerce",
+    ).fillna(0)
 
 variable_genes = [
     gene
     for gene in gene_columns
-    if df[gene].nunique() > 1
+    if train_df[gene].nunique() > 1
 ]
 
-
-removed_globally = (
-    len(gene_columns)
-    - len(variable_genes)
-)
-
-
-print(
-    f"Globally constant genes removed: "
-    f"{removed_globally:,}"
-)
-
-print(
-    f"Variable genes remaining: "
-    f"{len(variable_genes):,}"
-)
-
+print(f"\nPotential genes: {len(gene_columns):,}")
+print(f"Constant genes removed: {len(gene_columns) - len(variable_genes):,}")
+print(f"Variable genes remaining: {len(variable_genes):,}")
 
 gene_columns = variable_genes
 
-
-# ============================================================
-# X AND Y
-# ============================================================
-
-X = df[
-    gene_columns
-].copy()
-
-
-y = df[
-    TARGET
-].copy()
-
-
-# ============================================================
-# CROSS VALIDATION
-# ============================================================
-
-cv = RepeatedStratifiedKFold(
-
-    n_splits=N_SPLITS,
-
-    n_repeats=N_REPEATS,
-
-    random_state=RANDOM_STATE,
-)
-
-
-# ============================================================
-# NUMBERS OF GENES TO TEST
-# ============================================================
-
-gene_counts = [
-    1,
-    2,
-    3,
-    5,
-    10,
-    20,
-    40,
-]
-
+if len(gene_columns) == 0:
+    raise ValueError("No variable genes remain.")
 
 gene_counts = [
     k
-    for k in gene_counts
+    for k in GENE_COUNTS
     if k <= len(gene_columns)
 ]
 
+print(f"Numbers of genes tested: {gene_counts}")
+print(f"Frequency alpha values tested: {ALPHAS}")
 
-print(
-    "\nNumbers of genes being tested:"
+
+# ============================================================
+# SAVE TRAINING FREQUENCY PRIORS
+# ============================================================
+
+global_frequency, group_priors, group_counts = make_frequency_priors(
+    train_df,
+    cell_types,
 )
 
-print(
-    gene_counts
+frequency_records = []
+
+for key, priors in group_priors.items():
+
+    dataset, ap = key
+
+    group_n = sum(group_counts[key].values())
+
+    for cell_type in cell_types:
+
+        frequency_records.append({
+            "dataset": dataset,
+            "AP_position": ap,
+            "cell_type": cell_type,
+            "cell_count": group_counts[key][cell_type],
+            "group_total": group_n,
+            "raw_group_frequency": group_counts[key][cell_type] / group_n,
+            "global_frequency": global_frequency[cell_type],
+            "smoothed_frequency_prior": priors[cell_type],
+        })
+
+frequency_df = pd.DataFrame(frequency_records)
+
+frequency_df.to_csv(
+    OUTPUT_DIR / "training_frequency_priors.csv",
+    index=False,
 )
 
 
 # ============================================================
-# CLASSIFIERS
+# TEST ALL MODELS + GENES + FREQUENCY WEIGHTS
 # ============================================================
-
-models = {
-
-    "LogisticRegression":
-
-        LogisticRegression(
-
-            max_iter=5000,
-
-            class_weight="balanced",
-
-            random_state=RANDOM_STATE,
-        ),
-
-
-    "RandomForest":
-
-        RandomForestClassifier(
-
-            n_estimators=300,
-
-            max_depth=4,
-
-            class_weight="balanced",
-
-            random_state=RANDOM_STATE,
-
-            # cross_validate itself uses all cores
-            n_jobs=1,
-        ),
-
-
-    "ExtraTrees":
-
-        ExtraTreesClassifier(
-
-            n_estimators=300,
-
-            max_depth=4,
-
-            class_weight="balanced",
-
-            random_state=RANDOM_STATE,
-
-            n_jobs=1,
-        ),
-}
-
-
-# ============================================================
-# FUNCTION TO BUILD A PIPELINE
-# ============================================================
-
-def build_pipeline(
-    model_name,
-    number_of_genes,
-):
-
-    classifier = clone(
-        models[
-            model_name
-        ]
-    )
-
-
-    steps = [
-
-        # ----------------------------------------------------
-        # LOG TRANSFORM
-        # ----------------------------------------------------
-
-        (
-            "log_transform",
-
-            FunctionTransformer(
-                np.log1p
-            ),
-        ),
-
-
-        # ----------------------------------------------------
-        # REMOVE CONSTANT GENES WITHIN CURRENT TRAINING FOLD
-        # ----------------------------------------------------
-
-        (
-            "remove_constant",
-
-            VarianceThreshold(
-                threshold=0.0
-            ),
-        ),
-
-
-        # ----------------------------------------------------
-        # SELECT TOP GENES
-        # ----------------------------------------------------
-
-        (
-            "feature_selection",
-
-            SafeSelectKBest(
-                k=number_of_genes
-            ),
-        ),
-    ]
-
-
-    # Logistic regression benefits from scaling
-
-    if model_name == "LogisticRegression":
-
-        steps.append(
-
-            (
-                "scaler",
-
-                StandardScaler(),
-            )
-        )
-
-
-    steps.append(
-
-        (
-            "classifier",
-
-            classifier,
-        )
-    )
-
-
-    return Pipeline(
-        steps
-    )
-
-
-# ============================================================
-# TEST EVERY MODEL
-# ============================================================
-
-results = []
-
 
 print("\n" + "=" * 70)
-print("TESTING INDIVIDUAL MODELS")
+print("TESTING MODELS AND FREQUENCY WEIGHTS")
 print("=" * 70)
 
+results = []
 
 for model_name in models:
 
     for k in gene_counts:
 
-        print(
-            f"\nTesting "
-            f"{model_name} "
-            f"with top {k} genes..."
-        )
+        print(f"\nTesting {model_name} with {k} genes...")
 
-
-        pipeline = build_pipeline(
+        configuration_results = evaluate_model_configuration(
+            train_df,
+            gene_columns,
             model_name,
             k,
         )
 
+        results.extend(configuration_results)
 
-        scores = cross_validate(
+        for result in configuration_results:
 
-            pipeline,
-
-            X,
-
-            y,
-
-            cv=cv,
-
-            scoring={
-
-                "accuracy":
-                    "accuracy",
-
-                "balanced_accuracy":
-                    "balanced_accuracy",
-
-                "f1_macro":
-                    "f1_macro",
-            },
-
-            n_jobs=-1,
-
-            return_train_score=False,
-        )
-
-
-        result = {
-
-            "model":
-                model_name,
-
-            "number_of_genes":
-                k,
-
-            "accuracy_mean":
-                scores[
-                    "test_accuracy"
-                ].mean(),
-
-            "accuracy_sd":
-                scores[
-                    "test_accuracy"
-                ].std(),
-
-            "balanced_accuracy_mean":
-                scores[
-                    "test_balanced_accuracy"
-                ].mean(),
-
-            "balanced_accuracy_sd":
-                scores[
-                    "test_balanced_accuracy"
-                ].std(),
-
-            "macro_f1_mean":
-                scores[
-                    "test_f1_macro"
-                ].mean(),
-
-            "macro_f1_sd":
-                scores[
-                    "test_f1_macro"
-                ].std(),
-        }
-
-
-        results.append(
-            result
-        )
-
-
-        print(
-            f"  Accuracy: "
-            f"{result['accuracy_mean']:.3f}"
-        )
-
-        print(
-            f"  Balanced accuracy: "
-            f"{result['balanced_accuracy_mean']:.3f}"
-        )
+            print(
+                f"  alpha={result['alpha']}: "
+                f"balanced={result['balanced_accuracy_mean']:.3f}, "
+                f"accuracy={result['accuracy_mean']:.3f}"
+            )
 
 
 # ============================================================
-# RESULTS TABLE
+# MODEL RESULTS
 # ============================================================
 
-results_df = pd.DataFrame(
-    results
-)
+if len(results) == 0:
+    raise ValueError("No model configuration could be evaluated.")
 
-
-results_df = results_df.sort_values(
-
+results_df = pd.DataFrame(results).sort_values(
     [
         "balanced_accuracy_mean",
         "macro_f1_mean",
+        "accuracy_mean",
         "number_of_genes",
+        "alpha",
     ],
-
     ascending=[
         False,
         False,
+        False,
+        True,
         True,
     ],
-).reset_index(
-    drop=True
-)
+).reset_index(drop=True)
 
+results_df.to_csv(
+    OUTPUT_DIR / "frequency_weighted_model_comparison.csv",
+    index=False,
+)
 
 print("\n" + "=" * 70)
 print("MODEL RESULTS")
 print("=" * 70)
 
-
-print(
-    results_df.to_string(
-        index=False
-    )
-)
+print(results_df.to_string(index=False))
 
 
 # ============================================================
-# SAVE RESULTS
-# ============================================================
-
-results_df.to_csv(
-
-    OUTPUT_DIR
-    / "model_comparison.csv",
-
-    index=False,
-)
-
-
-# ============================================================
-# BEST INDIVIDUAL MODEL
+# BEST CONFIGURATION
 # ============================================================
 
 best = results_df.iloc[0]
 
-
-best_model_name = (
-    best["model"]
-)
-
-
-best_k = int(
-    best["number_of_genes"]
-)
-
+best_model_name = best["model"]
+best_k = int(best["number_of_genes"])
+best_alpha = float(best["alpha"])
 
 print("\n" + "=" * 70)
-print("BEST INDIVIDUAL METHOD")
+print("BEST CONFIGURATION")
 print("=" * 70)
 
+print(f"\nModel: {best_model_name}")
+print(f"Number of genes: {best_k}")
+print(f"Frequency alpha: {best_alpha}")
+print(f"Accuracy: {best['accuracy_mean']:.3f} +/- {best['accuracy_sd']:.3f}")
+print(f"Balanced accuracy: {best['balanced_accuracy_mean']:.3f} +/- {best['balanced_accuracy_sd']:.3f}")
+print(f"Macro F1: {best['macro_f1_mean']:.3f} +/- {best['macro_f1_sd']:.3f}")
 
-print(
-    f"\nModel: "
-    f"{best_model_name}"
-)
-
-print(
-    f"Number of genes: "
-    f"{best_k}"
-)
-
-print(
-    f"Balanced accuracy: "
-    f"{best['balanced_accuracy_mean']:.3f} "
-    f"+/- "
-    f"{best['balanced_accuracy_sd']:.3f}"
-)
-
-print(
-    f"Accuracy: "
-    f"{best['accuracy_mean']:.3f} "
-    f"+/- "
-    f"{best['accuracy_sd']:.3f}"
-)
+if best_alpha == 0:
+    print("\nFrequency weighting did NOT improve the selected model.")
+else:
+    print(f"\nFrequency weighting improved the selected configuration enough to choose alpha={best_alpha}.")
 
 
 # ============================================================
-# TOP THREE MODEL CONFIGURATIONS
+# COMPARE BEST WEIGHTED CONFIGURATION TO SAME MODEL WITH ALPHA=0
 # ============================================================
 
-top_three = (
-    results_df
-    .head(3)
-    .copy()
-)
+same_model_baseline = results_df[
+    (results_df["model"] == best_model_name)
+    & (results_df["number_of_genes"] == best_k)
+    & (results_df["alpha"] == 0)
+]
 
+if len(same_model_baseline) > 0:
 
-print("\n" + "=" * 70)
-print("TOP THREE METHODS")
-print("=" * 70)
+    baseline = same_model_baseline.iloc[0]
 
-
-print(
-    top_three[
-        [
-            "model",
-            "number_of_genes",
-            "accuracy_mean",
-            "balanced_accuracy_mean",
-            "macro_f1_mean",
-        ]
-    ].to_string(
-        index=False
-    )
-)
-
-
-top_three_methods = []
-
-
-for _, row in top_three.iterrows():
-
-    top_three_methods.append(
-
-        {
-
-            "model":
-                row["model"],
-
-            "number_of_genes":
-                int(
-                    row[
-                        "number_of_genes"
-                    ]
-                ),
-        }
-    )
+    print("\nSame model without frequency weighting:")
+    print(f"  Balanced accuracy: {baseline['balanced_accuracy_mean']:.3f}")
+    print(f"  Weighted balanced accuracy: {best['balanced_accuracy_mean']:.3f}")
+    print(f"  Difference: {best['balanced_accuracy_mean'] - baseline['balanced_accuracy_mean']:+.3f}")
 
 
 # ============================================================
-# MAJORITY-VOTE ENSEMBLE
+# ONE HELD-OUT PREDICTION PER TRAINING CELL
 # ============================================================
 
 print("\n" + "=" * 70)
-print("TESTING 2-OUT-OF-3 ENSEMBLE")
+print("ACTUAL VS PREDICTED CELL TYPES")
 print("=" * 70)
 
-
-ensemble_fold_results = []
-
-ensemble_prediction_records = []
-
-
-# Make a NEW identical CV object so that we reproduce
-# exactly the same style of cross-validation.
-
-ensemble_cv = RepeatedStratifiedKFold(
-
-    n_splits=N_SPLITS,
-
-    n_repeats=N_REPEATS,
-
+prediction_cv = StratifiedKFold(
+    n_splits=actual_splits,
+    shuffle=True,
     random_state=RANDOM_STATE,
 )
 
+prediction_records = []
 
-# ============================================================
-# RUN EVERY FOLD
-# ============================================================
-
-for fold_number, (
-    train_index,
-    validation_index,
-) in enumerate(
-    ensemble_cv.split(
-        X,
-        y,
-    ),
+for fold_number, (train_index, validation_index) in enumerate(
+    prediction_cv.split(train_df, train_df[TARGET]),
     start=1,
 ):
 
+    train_fold = train_df.iloc[train_index].copy()
+    validation_fold = train_df.iloc[validation_index].copy()
 
-    X_train = X.iloc[
-        train_index
-    ]
-
-    X_validation = X.iloc[
-        validation_index
-    ]
-
-
-    y_train = y.iloc[
-        train_index
-    ]
-
-    y_validation = y.iloc[
-        validation_index
-    ]
-
-
-    # ========================================================
-    # GET PREDICTIONS FROM ALL THREE METHODS
-    # ========================================================
-
-    model_predictions = []
-
-
-    for method in top_three_methods:
-
-        pipeline = build_pipeline(
-
-            method[
-                "model"
-            ],
-
-            method[
-                "number_of_genes"
-            ],
-        )
-
-
-        pipeline.fit(
-            X_train,
-            y_train,
-        )
-
-
-        predictions = pipeline.predict(
-            X_validation
-        )
-
-
-        model_predictions.append(
-            predictions
-        )
-
-
-    # ========================================================
-    # MAJORITY VOTE FOR EACH CELL
-    # ========================================================
-
-    ensemble_predictions = []
-
-
-    for i in range(
-        len(y_validation)
-    ):
-
-        votes = [
-
-            model_predictions[0][i],
-
-            model_predictions[1][i],
-
-            model_predictions[2][i],
-        ]
-
-
-        majority_vote = (
-
-            Counter(
-                votes
-            )
-            .most_common(1)[0][0]
-        )
-
-
-        ensemble_predictions.append(
-            majority_vote
-        )
-
-
-    ensemble_predictions = np.array(
-        ensemble_predictions
+    pipeline = build_pipeline(
+        best_model_name,
+        best_k,
     )
 
-
-    # ========================================================
-    # FOLD METRICS
-    # ========================================================
-
-    fold_accuracy = accuracy_score(
-
-        y_validation,
-
-        ensemble_predictions,
+    pipeline.fit(
+        train_fold[gene_columns],
+        train_fold[TARGET],
     )
 
-
-    fold_balanced_accuracy = (
-        balanced_accuracy_score(
-
-            y_validation,
-
-            ensemble_predictions,
-        )
+    prediction_info = frequency_weighted_predict(
+        pipeline,
+        train_fold,
+        validation_fold,
+        gene_columns,
+        best_alpha,
     )
 
-
-    fold_macro_f1 = f1_score(
-
-        y_validation,
-
-        ensemble_predictions,
-
-        average="macro",
-    )
-
-
-    ensemble_fold_results.append(
-
-        {
-
-            "fold":
-                fold_number,
-
-            "accuracy":
-                fold_accuracy,
-
-            "balanced_accuracy":
-                fold_balanced_accuracy,
-
-            "macro_f1":
-                fold_macro_f1,
-        }
-    )
-
-
-    # ========================================================
-    # SAVE PER-CELL PREDICTIONS
-    # ========================================================
-
-    for i, original_index in enumerate(
-        validation_index
-    ):
-
-        ensemble_prediction_records.append(
-
-            {
-
-                "fold":
-                    fold_number,
-
-                "row_index":
-                    original_index,
-
-                "true_cell_type":
-                    y_validation.iloc[i],
-
-                "model_1":
-                    model_predictions[0][i],
-
-                "model_2":
-                    model_predictions[1][i],
-
-                "model_3":
-                    model_predictions[2][i],
-
-                "ensemble_prediction":
-                    ensemble_predictions[i],
-
-                "correct":
-                    (
-                        ensemble_predictions[i]
-                        ==
-                        y_validation.iloc[i]
-                    ),
-            }
-        )
-
-
-# ============================================================
-# ENSEMBLE RESULTS DATAFRAME
-# ============================================================
-
-ensemble_results_df = pd.DataFrame(
-    ensemble_fold_results
-)
-
-
-ensemble_predictions_df = pd.DataFrame(
-    ensemble_prediction_records
-)
-
-
-# ============================================================
-# MEAN ENSEMBLE PERFORMANCE
-# ============================================================
-
-ensemble_accuracy_mean = (
-    ensemble_results_df[
-        "accuracy"
-    ].mean()
-)
-
-
-ensemble_accuracy_sd = (
-    ensemble_results_df[
-        "accuracy"
-    ].std()
-)
-
-
-ensemble_balanced_mean = (
-    ensemble_results_df[
-        "balanced_accuracy"
-    ].mean()
-)
-
-
-ensemble_balanced_sd = (
-    ensemble_results_df[
-        "balanced_accuracy"
-    ].std()
-)
-
-
-ensemble_f1_mean = (
-    ensemble_results_df[
-        "macro_f1"
-    ].mean()
-)
-
-
-ensemble_f1_sd = (
-    ensemble_results_df[
-        "macro_f1"
-    ].std()
-)
-
-
-# ============================================================
-# PRINT ENSEMBLE RESULTS
-# ============================================================
-
-print("\n" + "=" * 70)
-print("ENSEMBLE RESULTS")
-print("=" * 70)
-
-
-print(
-    f"\nAccuracy: "
-    f"{ensemble_accuracy_mean:.3f} "
-    f"+/- "
-    f"{ensemble_accuracy_sd:.3f}"
-)
-
-
-print(
-    f"Balanced accuracy: "
-    f"{ensemble_balanced_mean:.3f} "
-    f"+/- "
-    f"{ensemble_balanced_sd:.3f}"
-)
-
-
-print(
-    f"Macro F1: "
-    f"{ensemble_f1_mean:.3f} "
-    f"+/- "
-    f"{ensemble_f1_sd:.3f}"
-)
-
-
-# ============================================================
-# COMPARE ENSEMBLE VS BEST MODEL
-# ============================================================
-
-print("\n" + "=" * 70)
-print("ENSEMBLE VS BEST INDIVIDUAL MODEL")
-print("=" * 70)
-
-
-best_accuracy = (
-    best[
-        "accuracy_mean"
-    ]
-)
-
-
-best_balanced = (
-    best[
-        "balanced_accuracy_mean"
-    ]
-)
-
-
-print(
-    f"\nBest individual accuracy: "
-    f"{best_accuracy:.3f}"
-)
-
-
-print(
-    f"Ensemble accuracy:        "
-    f"{ensemble_accuracy_mean:.3f}"
-)
-
-
-print(
-    f"Difference:               "
-    f"{ensemble_accuracy_mean - best_accuracy:+.3f}"
-)
-
-
-print(
-    f"\nBest individual balanced accuracy: "
-    f"{best_balanced:.3f}"
-)
-
-
-print(
-    f"Ensemble balanced accuracy:        "
-    f"{ensemble_balanced_mean:.3f}"
-)
-
-
-print(
-    f"Difference:                        "
-    f"{ensemble_balanced_mean - best_balanced:+.3f}"
-)
-
-
-# ============================================================
-# SAVE ENSEMBLE RESULTS
-# ============================================================
-
-ensemble_summary = pd.DataFrame(
-
-    {
-
-        "metric": [
-            "accuracy",
-            "balanced_accuracy",
-            "macro_f1",
-        ],
-
-        "mean": [
-            ensemble_accuracy_mean,
-            ensemble_balanced_mean,
-            ensemble_f1_mean,
-        ],
-
-        "sd": [
-            ensemble_accuracy_sd,
-            ensemble_balanced_sd,
-            ensemble_f1_sd,
-        ],
-    }
-)
-
-
-ensemble_summary.to_csv(
-
-    OUTPUT_DIR
-    / "ensemble_results.csv",
-
+    for i, original_index in enumerate(validation_index):
+
+        info = prediction_info.iloc[i]
+        actual = validation_fold.iloc[i][TARGET]
+
+        prediction_records.append({
+            "identity_number": train_df.loc[original_index, TRAIN_ID],
+            "Datasets": validation_fold.iloc[i][DATASET_COL],
+            "AP_position": validation_fold.iloc[i][AP_COL],
+            "normal_prediction": info["normal_prediction"],
+            "predicted_cell_type": info["weighted_prediction"],
+            "actual_cell_type": actual,
+            "prediction_changed": info["prediction_changed"],
+            "normal_correct": info["normal_prediction"] == actual,
+            "weighted_correct": info["weighted_prediction"] == actual,
+            "normal_probability": info["normal_probability"],
+            "model_probability_for_weighted_class": info["model_probability_for_weighted_class"],
+            "training_frequency_prior": info["training_frequency_prior"],
+            "weighted_probability": info["weighted_probability"],
+            "prior_source": info["prior_source"],
+            "fold": fold_number,
+        })
+
+prediction_df = pd.DataFrame(prediction_records).sort_values(
+    "identity_number"
+).reset_index(drop=True)
+
+prediction_df.to_csv(
+    OUTPUT_DIR / "best_model_identity_predictions.csv",
     index=False,
 )
 
-
-ensemble_predictions_df.to_csv(
-
-    OUTPUT_DIR
-    / "ensemble_cell_predictions.csv",
-
+prediction_df[
+    [
+        "identity_number",
+        "predicted_cell_type",
+        "actual_cell_type",
+    ]
+].to_csv(
+    OUTPUT_DIR / "best_model_identity_predictions_simple.csv",
     index=False,
 )
 
 
 # ============================================================
-# SHOW ENSEMBLE CONFUSION MATRIX
+# ACTUAL VS PREDICTED PERFORMANCE
 # ============================================================
 
-all_true = (
-    ensemble_predictions_df[
-        "true_cell_type"
-    ]
+normal_accuracy = prediction_df["normal_correct"].mean()
+weighted_accuracy = prediction_df["weighted_correct"].mean()
+
+normal_balanced = balanced_accuracy_score(
+    prediction_df["actual_cell_type"],
+    prediction_df["normal_prediction"],
+)
+
+weighted_balanced = balanced_accuracy_score(
+    prediction_df["actual_cell_type"],
+    prediction_df["predicted_cell_type"],
+)
+
+normal_f1 = f1_score(
+    prediction_df["actual_cell_type"],
+    prediction_df["normal_prediction"],
+    average="macro",
+    zero_division=0,
+)
+
+weighted_f1 = f1_score(
+    prediction_df["actual_cell_type"],
+    prediction_df["predicted_cell_type"],
+    average="macro",
+    zero_division=0,
+)
+
+print(f"\nNormal accuracy: {normal_accuracy:.3%}")
+print(f"Weighted accuracy: {weighted_accuracy:.3%}")
+print(f"Difference: {weighted_accuracy - normal_accuracy:+.3%}")
+
+print(f"\nNormal balanced accuracy: {normal_balanced:.3%}")
+print(f"Weighted balanced accuracy: {weighted_balanced:.3%}")
+print(f"Difference: {weighted_balanced - normal_balanced:+.3%}")
+
+print(f"\nNormal macro F1: {normal_f1:.3%}")
+print(f"Weighted macro F1: {weighted_f1:.3%}")
+
+changed_df = prediction_df[
+    prediction_df["prediction_changed"]
+].copy()
+
+print(f"\nPredictions changed by frequency weighting: {len(changed_df):,} / {len(prediction_df):,}")
+
+if len(changed_df) > 0:
+    print(f"Normal accuracy among changed cells: {changed_df['normal_correct'].mean():.3%}")
+    print(f"Weighted accuracy among changed cells: {changed_df['weighted_correct'].mean():.3%}")
+
+changed_df.to_csv(
+    OUTPUT_DIR / "predictions_changed_by_frequency.csv",
+    index=False,
 )
 
 
-all_predicted = (
-    ensemble_predictions_df[
-        "ensemble_prediction"
-    ]
+# ============================================================
+# INCORRECT WEIGHTED PREDICTIONS
+# ============================================================
+
+incorrect_df = prediction_df[
+    ~prediction_df["weighted_correct"]
+].copy()
+
+incorrect_df.to_csv(
+    OUTPUT_DIR / "incorrect_weighted_predictions.csv",
+    index=False,
 )
 
+
+# ============================================================
+# ACCURACY BY CELL TYPE
+# ============================================================
+
+accuracy_by_type = (
+    prediction_df
+    .groupby("actual_cell_type")
+    .agg(
+        number_of_cells=("weighted_correct", "size"),
+        normal_correct=("normal_correct", "sum"),
+        weighted_correct=("weighted_correct", "sum"),
+        normal_accuracy=("normal_correct", "mean"),
+        weighted_accuracy=("weighted_correct", "mean"),
+    )
+    .reset_index()
+)
+
+accuracy_by_type["difference"] = (
+    accuracy_by_type["weighted_accuracy"]
+    - accuracy_by_type["normal_accuracy"]
+)
+
+accuracy_by_type = accuracy_by_type.sort_values(
+    "weighted_accuracy"
+)
+
+accuracy_by_type.to_csv(
+    OUTPUT_DIR / "accuracy_by_cell_type.csv",
+    index=False,
+)
+
+print("\n" + "=" * 70)
+print("ACCURACY BY CELL TYPE")
+print("=" * 70)
+
+print(accuracy_by_type.to_string(index=False))
+
+
+# ============================================================
+# CONFUSION MATRIX
+# ============================================================
 
 cm = confusion_matrix(
-
-    all_true,
-
-    all_predicted,
-
+    prediction_df["actual_cell_type"],
+    prediction_df["predicted_cell_type"],
     labels=cell_types,
 )
 
-
 confusion_df = pd.DataFrame(
-
     cm,
-
-    index=[
-        f"Actual_{x}"
-        for x in cell_types
-    ],
-
-    columns=[
-        f"Predicted_{x}"
-        for x in cell_types
-    ],
+    index=[f"Actual_{cell_type}" for cell_type in cell_types],
+    columns=[f"Predicted_{cell_type}" for cell_type in cell_types],
 )
-
-
-print("\n" + "=" * 70)
-print("ENSEMBLE CONFUSION MATRIX")
-print("=" * 70)
-
-
-print(
-    "\n",
-    confusion_df,
-)
-
 
 confusion_df.to_csv(
-
-    OUTPUT_DIR
-    / "ensemble_confusion_matrix.csv"
+    OUTPUT_DIR / "weighted_confusion_matrix.csv"
 )
 
 
 # ============================================================
-# HOW OFTEN DO ALL THREE MODELS AGREE?
-# ============================================================
-
-ensemble_predictions_df[
-    "all_three_agree"
-] = (
-
-    (
-        ensemble_predictions_df[
-            "model_1"
-        ]
-        ==
-        ensemble_predictions_df[
-            "model_2"
-        ]
-    )
-
-    &
-
-    (
-        ensemble_predictions_df[
-            "model_2"
-        ]
-        ==
-        ensemble_predictions_df[
-            "model_3"
-        ]
-    )
-)
-
-
-agreement_rate = (
-
-    ensemble_predictions_df[
-        "all_three_agree"
-    ].mean()
-)
-
-
-print(
-    f"\nAll three models agree on "
-    f"{agreement_rate:.1%} "
-    f"of predictions."
-)
-
-
-# ============================================================
-# ACCURACY WHEN ALL THREE AGREE
-# ============================================================
-
-agreement_rows = (
-
-    ensemble_predictions_df[
-        ensemble_predictions_df[
-            "all_three_agree"
-        ]
-    ]
-)
-
-
-if len(
-    agreement_rows
-) > 0:
-
-    agreement_accuracy = (
-
-        agreement_rows[
-            "correct"
-        ].mean()
-    )
-
-
-    print(
-        f"Accuracy when all 3 agree: "
-        f"{agreement_accuracy:.1%}"
-    )
-
-
-# ============================================================
-# ACCURACY WHEN ONLY 2 OF 3 AGREE
-# ============================================================
-
-split_vote_rows = (
-
-    ensemble_predictions_df[
-        ~ensemble_predictions_df[
-            "all_three_agree"
-        ]
-    ]
-)
-
-
-if len(
-    split_vote_rows
-) > 0:
-
-    split_vote_accuracy = (
-
-        split_vote_rows[
-            "correct"
-        ].mean()
-    )
-
-
-    print(
-        f"Accuracy when vote is 2-to-1: "
-        f"{split_vote_accuracy:.1%}"
-    )
-
-
-# ============================================================
-# GENE RANKING
+# FIT FINAL MODEL ON ALL NA TRAINING CELLS
 # ============================================================
 
 print("\n" + "=" * 70)
-print("RANKING GENES")
+print("TRAINING FINAL MODEL")
 print("=" * 70)
 
-
-X_log = np.log1p(
-    X
-)
-
-
-variance_filter = VarianceThreshold(
-    threshold=0.0
-)
-
-
-X_variable = (
-    variance_filter
-    .fit_transform(
-        X_log
-    )
-)
-
-
-variance_mask = (
-    variance_filter
-    .get_support()
-)
-
-
-genes_after_variance = np.array(
-    gene_columns
-)[
-    variance_mask
-]
-
-
-f_scores, p_values = f_classif(
-
-    X_variable,
-
-    y,
-)
-
-
-gene_ranking = pd.DataFrame(
-
-    {
-
-        "gene":
-            genes_after_variance,
-
-        "F_score":
-            f_scores,
-
-        "p_value":
-            p_values,
-    }
-)
-
-
-gene_ranking = gene_ranking.sort_values(
-
-    "F_score",
-
-    ascending=False,
-)
-
-
-# ============================================================
-# ADD MEAN EXPRESSION FOR BOTH CELL TYPES
-# ============================================================
-
-type_1 = cell_types[0]
-
-type_2 = cell_types[1]
-
-
-type_1_means = (
-
-    df[
-        df[TARGET] == type_1
-    ][gene_columns]
-    .mean()
-)
-
-
-type_2_means = (
-
-    df[
-        df[TARGET] == type_2
-    ][gene_columns]
-    .mean()
-)
-
-
-gene_ranking[
-    f"{type_1}_mean"
-] = (
-
-    gene_ranking[
-        "gene"
-    ]
-    .map(
-        type_1_means
-    )
-)
-
-
-gene_ranking[
-    f"{type_2}_mean"
-] = (
-
-    gene_ranking[
-        "gene"
-    ]
-    .map(
-        type_2_means
-    )
-)
-
-
-gene_ranking[
-    "mean_difference"
-] = (
-
-    gene_ranking[
-        f"{type_1}_mean"
-    ]
-
-    -
-
-    gene_ranking[
-        f"{type_2}_mean"
-    ]
-)
-
-
-# ============================================================
-# SHOW TOP 30 GENES
-# ============================================================
-
-print("\n" + "=" * 70)
-print("TOP 30 GENES")
-print("=" * 70)
-
-
-print(
-    gene_ranking
-    .head(30)
-    .to_string(
-        index=False
-    )
-)
-
-
-gene_ranking.to_csv(
-
-    OUTPUT_DIR
-    / "gene_ranking.csv",
-
-    index=False,
-)
-
-
-# ============================================================
-# FIT BEST INDIVIDUAL MODEL ON ALL DATA
-# ============================================================
-
-best_pipeline = build_pipeline(
-
+final_model = build_pipeline(
     best_model_name,
-
     best_k,
 )
 
-
-best_pipeline.fit(
-    X,
-    y,
+final_model.fit(
+    train_df[gene_columns],
+    train_df[TARGET],
 )
 
 
 # ============================================================
-# FIND GENES USED BY BEST MODEL
+# GENES USED BY FINAL MODEL
 # ============================================================
 
-variance_filter = (
-
-    best_pipeline
-    .named_steps[
-        "remove_constant"
-    ]
-)
-
-
-variance_mask = (
-
-    variance_filter
-    .get_support()
-)
-
+variance_mask = final_model.named_steps[
+    "remove_constant"
+].get_support()
 
 genes_after_variance = np.array(
     gene_columns
-)[
-    variance_mask
+)[variance_mask]
+
+selector = final_model.named_steps[
+    "feature_selection"
 ]
 
+selected_genes = genes_after_variance[
+    selector.get_support()
+]
 
-selector = (
-
-    best_pipeline
-    .named_steps[
-        "feature_selection"
-    ]
-)
-
-
-selected_mask = (
-
-    selector
-    .get_support()
-)
-
-
-selected_genes = (
-
-    genes_after_variance[
-        selected_mask
-    ]
-)
-
-
-print("\n" + "=" * 70)
-print("GENES USED BY BEST INDIVIDUAL MODEL")
-print("=" * 70)
-
+print("\nSelected genes:")
 
 for gene in selected_genes:
+    print(f"  {gene}")
 
-    print(
-        gene
-    )
-
-
-pd.DataFrame(
-
-    {
-        "gene":
-            selected_genes
-    }
-
-).to_csv(
-
-    OUTPUT_DIR
-    / "best_model_genes.csv",
-
+pd.DataFrame({
+    "gene": selected_genes
+}).to_csv(
+    OUTPUT_DIR / "final_selected_genes.csv",
     index=False,
 )
 
 
 # ============================================================
-# SIMPLE ONE-GENE DECISION RULE
+# PREDICT UNKNOWN TEST CELLS
 # ============================================================
 
-simple_tree = DecisionTreeClassifier(
-
-    max_depth=1,
-
-    class_weight="balanced",
-
-    random_state=RANDOM_STATE,
-)
-
-
-simple_tree.fit(
-    X,
-    y,
-)
-
-
-tree_rule = export_text(
-
-    simple_tree,
-
-    feature_names=list(
-        X.columns
-    ),
-)
-
-
 print("\n" + "=" * 70)
-print("BEST SIMPLE ONE-GENE RULE")
+print("PREDICTING UNKNOWN NA TEST CELLS")
 print("=" * 70)
 
+test_prediction_info = frequency_weighted_predict(
+    final_model,
+    train_df,
+    test_df,
+    gene_columns,
+    best_alpha,
+)
 
-print(
-    tree_rule
+test_output = test_df.copy()
+
+test_output["normal_prediction"] = test_prediction_info["normal_prediction"]
+test_output[TARGET] = test_prediction_info["weighted_prediction"]
+test_output["prediction_changed"] = test_prediction_info["prediction_changed"]
+test_output["normal_probability"] = test_prediction_info["normal_probability"]
+test_output["model_probability_for_weighted_class"] = test_prediction_info["model_probability_for_weighted_class"]
+test_output["training_frequency_prior"] = test_prediction_info["training_frequency_prior"]
+test_output["weighted_probability"] = test_prediction_info["weighted_probability"]
+test_output["prior_source"] = test_prediction_info["prior_source"]
+test_output["chosen_model"] = best_model_name
+test_output["chosen_number_of_genes"] = best_k
+test_output["frequency_alpha"] = best_alpha
+
+print(f"\nTest predictions changed by frequency weighting: {test_output['prediction_changed'].sum():,} / {len(test_output):,}")
+
+
+# ============================================================
+# SAVE FULL TEST OUTPUT
+# ============================================================
+
+test_output.drop(
+    columns=["_dataset_key", "_ap_key"],
+    errors="ignore",
+).to_csv(
+    OUTPUT_DIR / "NA_test_frequency_weighted_predictions.csv",
+    index=False,
 )
 
 
-with open(
+# ============================================================
+# SIMPLE TEST PREDICTION FILE
+# ============================================================
 
-    OUTPUT_DIR
-    / "simple_rule.txt",
+simple_test_output = pd.DataFrame({
+    "identity_number": test_output[TEST_ID],
+    "predicted_cell_type": test_output[TARGET],
+})
 
-    "w",
+simple_test_output.to_csv(
+    OUTPUT_DIR / "NA_test_predictions_simple.csv",
+    index=False,
+)
 
-) as file:
 
-    file.write(
-        tree_rule
-    )
+# ============================================================
+# SUMMARY
+# ============================================================
+
+summary_df = pd.DataFrame({
+    "metric": [
+        "selected_model",
+        "selected_number_of_genes",
+        "selected_alpha",
+        "normal_accuracy",
+        "weighted_accuracy",
+        "normal_balanced_accuracy",
+        "weighted_balanced_accuracy",
+        "normal_macro_f1",
+        "weighted_macro_f1",
+        "number_predictions_changed",
+    ],
+
+    "value": [
+        best_model_name,
+        best_k,
+        best_alpha,
+        normal_accuracy,
+        weighted_accuracy,
+        normal_balanced,
+        weighted_balanced,
+        normal_f1,
+        weighted_f1,
+        len(changed_df),
+    ],
+})
+
+summary_df.to_csv(
+    OUTPUT_DIR / "frequency_weighting_summary.csv",
+    index=False,
+)
 
 
 # ============================================================
@@ -1748,41 +1069,28 @@ print("\n" + "=" * 70)
 print("DONE")
 print("=" * 70)
 
+print(f"\nBest model: {best_model_name}")
+print(f"Best genes: {best_k}")
+print(f"Best frequency alpha: {best_alpha}")
 
-print(
-    f"\nResults saved in:\n"
-    f"{OUTPUT_DIR}"
-)
+print(f"\nNormal held-out accuracy: {normal_accuracy:.3%}")
+print(f"Weighted held-out accuracy: {weighted_accuracy:.3%}")
 
+print(f"\nNormal held-out balanced accuracy: {normal_balanced:.3%}")
+print(f"Weighted held-out balanced accuracy: {weighted_balanced:.3%}")
 
-print(
-    "\nFiles created:"
-)
+print(f"\nResults saved in:\n{OUTPUT_DIR}")
 
-print(
-    "  model_comparison.csv"
-)
-
-print(
-    "  ensemble_results.csv"
-)
-
-print(
-    "  ensemble_cell_predictions.csv"
-)
-
-print(
-    "  ensemble_confusion_matrix.csv"
-)
-
-print(
-    "  gene_ranking.csv"
-)
-
-print(
-    "  best_model_genes.csv"
-)
-
-print(
-    "  simple_rule.txt"
-)
+print("\nImportant files:")
+print("  frequency_weighted_model_comparison.csv")
+print("  frequency_weighting_summary.csv")
+print("  training_frequency_priors.csv")
+print("  best_model_identity_predictions.csv")
+print("  best_model_identity_predictions_simple.csv")
+print("  predictions_changed_by_frequency.csv")
+print("  incorrect_weighted_predictions.csv")
+print("  accuracy_by_cell_type.csv")
+print("  weighted_confusion_matrix.csv")
+print("  final_selected_genes.csv")
+print("  NA_test_frequency_weighted_predictions.csv")
+print("  NA_test_predictions_simple.csv")

@@ -1,0 +1,11 @@
+metric,value
+selected_model,LogisticRegression
+selected_number_of_genes,40
+selected_alpha,0.0
+normal_accuracy,0.5956727518593644
+weighted_accuracy,0.5956727518593644
+normal_balanced_accuracy,0.6032779123296288
+weighted_balanced_accuracy,0.6032779123296288
+normal_macro_f1,0.5403826590283017
+weighted_macro_f1,0.5403826590283017
+number_predictions_changed,0
